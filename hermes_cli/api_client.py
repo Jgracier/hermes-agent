@@ -7,7 +7,6 @@ Usage:
     hermes client revoke <client_id>  # Revoke a client's access
 """
 
-import json
 import os
 import shutil
 import subprocess
@@ -47,11 +46,10 @@ def _cmd_enroll():
     store = APIClientStore()
     token = store.create_enrollment()
     claim_url = f"http://{host}:{api_port}/api/enroll/claim?token={token}"
-    payload = json.dumps({"type": "hermes.api.enroll", "enroll_url": claim_url})
 
     print()
     print("  Scan to connect:\n")
-    _print_qr(payload)
+    _print_qr(claim_url)
     print()
     print("  Or copy this URL:")
     print(f"  {claim_url}")
