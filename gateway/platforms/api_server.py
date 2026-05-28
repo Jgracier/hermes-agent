@@ -3490,7 +3490,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "api_key": api_key,
             "client_id": result["client_id"],
             "dashboard_base_url": base,
-            "dashboard_session_token": api_key,
             "dashboard_model_options_url": f"{base}/api/model/options",
             "dashboard_model_set_url": f"{base}/api/model/set",
         })
