@@ -34,7 +34,7 @@ def client_command(args):
 # ------------------------------------------------------------------
 
 def _cmd_enroll():
-    from gateway.api_client_store import APIClientStore, DEFAULT_ENROLLMENT_TTL, get_tailscale_host
+    from gateway.api_client_store import APIClientStore, DEFAULT_ENROLLMENT_TTL
 
     host = _ensure_tailscale()
     if not host:
