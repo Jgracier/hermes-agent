@@ -52,7 +52,7 @@ ENROLLMENT_TOKEN_PREFIX = "hqe_"
 CLIENT_KEY_PREFIX = "hca_"
 CLIENT_ID_PREFIX = "clt_"
 
-DEFAULT_ENROLLMENT_TTL = 600  # 10 minutes
+DEFAULT_ENROLLMENT_TTL = 120  # 2 minutes
 
 CLIENTS_DIR = get_hermes_dir("platforms/api_clients", "api_clients")
 
