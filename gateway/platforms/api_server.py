@@ -697,6 +697,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        from gateway.api_client_store import APIClientStore
+        self._client_store = APIClientStore()
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -827,14 +829,16 @@ class APIServerAdapter(BasePlatformAdapter):
         If no API key is configured, all requests are allowed (only when API
         server is local).
         """
-        if not self._api_key:
-            return None  # No key configured — allow all (local-only use)
+        if not self._api_key and not self._client_store.has_any_clients():
+            return None  # No auth configured — allow all (local-only use)
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
-            if hmac.compare_digest(token, self._api_key):
-                return None  # Auth OK
+            if self._api_key and hmac.compare_digest(token, self._api_key):
+                return None  # Global key OK
+            if self._client_store.verify_client_key(token):
+                return None  # Per-client key OK
 
         logger.warning(
             "API server rejected invalid API key: %s",
@@ -1089,6 +1093,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
+                "client_enrollment": True,
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
@@ -3438,6 +3443,52 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    async def _handle_enroll_claim(self, request: "web.Request") -> "web.Response":
+        """GET|POST /api/enroll/claim — redeem a one-time enrollment token for a client API key.
+
+        Unauthenticated endpoint. Security is provided by the one-time token
+        which is stored only as a salted SHA-256 hash and burned on first use.
+
+        GET  /api/enroll/claim?token=hqe_...
+        POST /api/enroll/claim  {"token": "hqe_...", "client_name": "my-ipad"}
+        """
+        if request.method == "GET":
+            token = request.rel_url.query.get("token", "").strip()
+            client_name = request.rel_url.query.get("client_name", "").strip()
+        else:
+            try:
+                body = await request.json()
+            except Exception:
+                return web.json_response(
+                    {"error": "invalid JSON body"}, status=400
+                )
+            token = str(body.get("token", "")).strip()
+            client_name = str(body.get("client_name", "")).strip()
+
+        if not token:
+            return web.json_response({"error": "token is required"}, status=400)
+
+        result = self._client_store.claim_enrollment(token, client_name)
+        if result is None:
+            return web.json_response(
+                {"error": "invalid or expired enrollment token"}, status=401
+            )
+
+        from gateway.api_client_store import get_tailscale_host
+        host = get_tailscale_host() or self._host
+        api_base_url = f"http://{host}:{self._port}/v1"
+
+        logger.info(
+            "[%s] New client enrolled: %s (id: %s)",
+            self.name, client_name or "unknown", result["client_id"],
+        )
+
+        return web.json_response({
+            "api_base_url": api_base_url,
+            "api_key": result["api_key"],
+            "client_id": result["client_id"],
+        })
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -3511,6 +3562,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Client enrollment — unauthenticated, one-time token validated inside
+            self._app.router.add_get("/api/enroll/claim", self._handle_enroll_claim)
+            self._app.router.add_post("/api/enroll/claim", self._handle_enroll_claim)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:

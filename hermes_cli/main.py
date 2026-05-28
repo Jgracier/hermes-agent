@@ -12313,6 +12313,28 @@ Examples:
     config_parser.set_defaults(func=cmd_config)
 
     # =========================================================================
+    # client command
+    # =========================================================================
+    client_parser = subparsers.add_parser(
+        "client",
+        help="Manage external API clients via QR enrollment",
+        description="Enroll, list, and revoke external devices connected over Tailscale",
+    )
+    client_sub = client_parser.add_subparsers(dest="client_action")
+
+    client_sub.add_parser("enroll", help="Generate enrollment QR code and URL")
+    client_sub.add_parser("list", help="Show enrolled clients")
+
+    client_revoke_parser = client_sub.add_parser("revoke", help="Revoke a client's access")
+    client_revoke_parser.add_argument("client_id", help="Client ID to revoke (from 'hermes client list')")
+
+    def cmd_client(args):
+        from hermes_cli.api_client import client_command
+        client_command(args)
+
+    client_parser.set_defaults(func=cmd_client)
+
+    # =========================================================================
     # pairing command
     # =========================================================================
     pairing_parser = subparsers.add_parser(
