@@ -119,8 +119,15 @@ def _ensure_api_server():
         os.environ["API_SERVER_HOST"] = "0.0.0.0"
         _write_env_vars(env_path, writes)
         print("  API server configured for external access.")
+    else:
+        # Already configured — check if API server is already reachable
+        try:
+            urllib.request.urlopen(f"http://localhost:{api_port}/health", timeout=2)
+            return  # Up and configured — nothing to do
+        except Exception:
+            pass  # Not reachable — fall through to start/restart below
 
-    # Restart or start the gateway to pick up config
+    # Restart or start the gateway to pick up config changes (or bring it up)
     pids = find_gateway_pids()
     if pids:
         print("  Restarting gateway...", end=" ", flush=True)
