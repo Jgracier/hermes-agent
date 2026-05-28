@@ -1094,6 +1094,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
                 "client_enrollment": True,
+                "model_picker": True,
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
@@ -3476,7 +3477,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         from gateway.api_client_store import get_tailscale_host
         host = get_tailscale_host() or self._host
-        api_base_url = f"http://{host}:{self._port}/v1"
+        base = f"http://{host}:{self._port}"
+        api_key = result["api_key"]
 
         logger.info(
             "[%s] New client enrolled: %s (id: %s)",
@@ -3484,10 +3486,110 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         return web.json_response({
-            "api_base_url": api_base_url,
-            "api_key": result["api_key"],
+            "api_base_url": f"{base}/v1",
+            "api_key": api_key,
             "client_id": result["client_id"],
+            "dashboard_base_url": base,
+            "dashboard_session_token": api_key,
+            "dashboard_model_options_url": f"{base}/api/model/options",
+            "dashboard_model_set_url": f"{base}/api/model/set",
         })
+
+    async def _handle_model_options(self, request: "web.Request") -> "web.Response":
+        """GET /api/model/options — return available providers and model lists.
+
+        Uses the same inventory functions as the dashboard web server so the
+        client model picker shows identical options.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from hermes_cli.inventory import build_models_payload, load_picker_context
+            payload = build_models_payload(load_picker_context(), max_models=50)
+            return web.json_response(payload)
+        except Exception:
+            logger.exception("[%s] GET /api/model/options failed", self.name)
+            return web.json_response({"error": "failed to list model options"}, status=500)
+
+    async def _handle_model_set(self, request: "web.Request") -> "web.Response":
+        """POST /api/model/set — assign a provider/model to main or auxiliary slot.
+
+        Body mirrors the dashboard POST /api/model/set shape:
+          {"scope": "main", "provider": "openrouter", "model": "anthropic/claude-opus-4.7"}
+          {"scope": "auxiliary", "task": "vision", "provider": "openrouter", "model": "..."}
+        Writes to ~/.hermes/config.yaml — applies to new sessions only.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        scope = str(body.get("scope", "")).strip().lower()
+        provider = str(body.get("provider", "")).strip()
+        model = str(body.get("model", "")).strip()
+        task = str(body.get("task", "")).strip().lower()
+
+        if scope not in {"main", "auxiliary"}:
+            return web.json_response({"error": "scope must be 'main' or 'auxiliary'"}, status=400)
+
+        try:
+            from hermes_cli.config import load_config, save_config
+            cfg = load_config()
+
+            if scope == "main":
+                if not provider or not model:
+                    return web.json_response({"error": "provider and model required"}, status=400)
+                model_cfg = cfg.get("model", {})
+                if not isinstance(model_cfg, dict):
+                    model_cfg = {}
+                model_cfg["provider"] = provider
+                model_cfg["default"] = model
+                model_cfg["base_url"] = ""
+                model_cfg.pop("context_length", None)
+                cfg["model"] = model_cfg
+                save_config(cfg)
+                logger.info("[%s] Model set: %s/%s", self.name, provider, model)
+                return web.json_response({"ok": True, "scope": "main", "provider": provider, "model": model})
+
+            # auxiliary
+            _AUX_TASK_SLOTS = ("vision", "summary", "title", "embedding", "code", "search")
+            aux = cfg.get("auxiliary") or {}
+            if not isinstance(aux, dict):
+                aux = {}
+
+            if task == "__reset__":
+                for slot in _AUX_TASK_SLOTS:
+                    slot_cfg = aux.get(slot) or {}
+                    slot_cfg["provider"] = "auto"
+                    slot_cfg["model"] = ""
+                    aux[slot] = slot_cfg
+                cfg["auxiliary"] = aux
+                save_config(cfg)
+                return web.json_response({"ok": True, "scope": "auxiliary", "reset": True})
+
+            if not provider:
+                return web.json_response({"error": "provider required for auxiliary"}, status=400)
+
+            targets = [task] if task else list(_AUX_TASK_SLOTS)
+            for slot in targets:
+                if slot not in _AUX_TASK_SLOTS:
+                    return web.json_response({"error": f"unknown auxiliary task: {slot}"}, status=400)
+                slot_cfg = aux.get(slot) or {}
+                slot_cfg["provider"] = provider
+                slot_cfg["model"] = model
+                aux[slot] = slot_cfg
+
+            cfg["auxiliary"] = aux
+            save_config(cfg)
+            return web.json_response({"ok": True, "scope": "auxiliary", "tasks": targets, "provider": provider, "model": model})
+
+        except Exception:
+            logger.exception("[%s] POST /api/model/set failed", self.name)
+            return web.json_response({"error": "failed to save model assignment"}, status=500)
 
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
@@ -3565,6 +3667,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Client enrollment — unauthenticated, one-time token validated inside
             self._app.router.add_get("/api/enroll/claim", self._handle_enroll_claim)
             self._app.router.add_post("/api/enroll/claim", self._handle_enroll_claim)
+            # Model picker — authenticated, mirrors dashboard /api/model/* endpoints
+            self._app.router.add_get("/api/model/options", self._handle_model_options)
+            self._app.router.add_post("/api/model/set", self._handle_model_set)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
