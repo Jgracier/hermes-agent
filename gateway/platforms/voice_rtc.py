@@ -188,87 +188,62 @@ class VoiceRTCSession:
         self._tts_abort.clear()
 
     async def _run_and_speak(self, text: str) -> None:
-        """Send *text* to the LLM via /v1/runs, stream events, speak response."""
+        """Send *text* to LLM via /v1/chat/completions streaming — single request, no race."""
         import json, urllib.request, urllib.error
 
         port = os.getenv("API_SERVER_PORT", "8642")
         base = f"http://localhost:{port}"
         api_key = os.getenv("API_SERVER_KEY", "")
         logger.info("[voice_rtc] %s starting LLM run for: %s", self._client_id, text[:40])
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-Hermes-Session-Id": self._session_id,
-        }
 
-        # Step 1 — POST /v1/runs, get run_id back immediately
-        body = json.dumps({"input": text, "session_id": self._session_id}).encode()
-        req = urllib.request.Request(f"{base}/v1/runs", data=body, headers=headers, method="POST")
-        try:
-            resp = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: urllib.request.urlopen(req, timeout=10)
-            )
-            run_data = json.loads(resp.read())
-            run_id = run_data.get("id") or run_data.get("run_id")
-        except Exception as e:
-            logger.warning("[voice_rtc] LLM run create failed: %s", e)
-            return
-
-        if not run_id:
-            logger.warning("[voice_rtc] No run_id in response: %s", run_data)
-            return
-
-        self._active_run_id = run_id
-        logger.info("[voice_rtc] %s run created: %s", self._client_id, run_id)
-
-        # Step 2 — GET /v1/runs/{run_id}/events, collect SSE text deltas.
-        # Run entirely in executor — SSE iteration is blocking I/O and must
-        # not touch the asyncio event loop directly.
-        event_req = urllib.request.Request(
-            f"{base}/v1/runs/{run_id}/events",
-            headers={**headers, "Accept": "text/event-stream"},
+        body = json.dumps({
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": text}],
+            "stream": True,
+        }).encode()
+        req = urllib.request.Request(
+            f"{base}/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "X-Hermes-Session-Id": self._session_id,
+                "Accept": "text/event-stream",
+            },
+            method="POST",
         )
+
         abort = self._tts_abort
 
-        def _consume_events() -> str:
-            text = ""
-            # Retry a few times — the run may not have started streaming yet
-            for attempt in range(3):
-                try:
-                    resp = urllib.request.urlopen(event_req, timeout=120)
-                    for raw_line in resp:
-                        if abort.is_set():
-                            break
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            event = json.loads(payload)
-                            delta = (event.get("choices", [{}])[0]
-                                     .get("delta", {})
-                                     .get("content", ""))
-                            if delta:
-                                text += delta
-                        except Exception:
-                            pass
-                    if text:
+        def _stream_response() -> str:
+            collected = ""
+            try:
+                resp = urllib.request.urlopen(req, timeout=120)
+                logger.info("[voice_rtc] %s SSE stream opened", self._client_id)
+                for raw_line in resp:
+                    if abort.is_set():
                         break
-                    import time as _time
-                    _time.sleep(0.5)
-                except Exception as e:
-                    logger.warning("[voice_rtc] LLM run events attempt %d failed: %s", attempt + 1, e)
-                    import time as _time
-                    _time.sleep(0.5)
-            return text
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                        delta = (event.get("choices", [{}])[0]
+                                 .get("delta", {})
+                                 .get("content", ""))
+                        if delta:
+                            collected += delta
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("[voice_rtc] LLM stream failed: %s", e)
+            return collected
 
-        full_text = ""
-        try:
-            full_text = await asyncio.get_event_loop().run_in_executor(None, _consume_events)
-        finally:
-            self._active_run_id = None
+        full_text = await asyncio.get_event_loop().run_in_executor(None, _stream_response)
+        self._active_run_id = None
 
         logger.info("[voice_rtc] %s LLM response (%d chars): %s", self._client_id, len(full_text), full_text[:60])
         if not full_text or self._tts_abort.is_set():
