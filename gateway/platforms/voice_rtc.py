@@ -367,7 +367,7 @@ def _make_tts_track():
         async def recv(self):
             from fractions import Fraction
             try:
-                pcm = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                pcm = await asyncio.wait_for(self._queue.get(), timeout=0.02)
             except asyncio.TimeoutError:
                 pcm = bytes(self._samples_per_frame * 2)  # silence
 
@@ -382,19 +382,28 @@ def _make_tts_track():
 
         async def feed_audio_file(self, path: str, abort_event: asyncio.Event) -> None:
             try:
-                container = _av.open(path)
-                resampler = _av.AudioResampler(format="s16", layout="mono", rate=self._sample_rate)
-                for frame in container.decode(audio=0):
+                loop = asyncio.get_event_loop()
+                def _decode():
+                    chunks = []
+                    container = _av.open(path)
+                    resampler = _av.AudioResampler(format="s16", layout="mono", rate=self._sample_rate)
+                    chunk_size = self._samples_per_frame * 2
+                    buf = b""
+                    for frame in container.decode(audio=0):
+                        for resampled in resampler.resample(frame):
+                            buf += bytes(resampled.planes[0])
+                    # flush resampler
+                    for resampled in resampler.resample(None):
+                        buf += bytes(resampled.planes[0])
+                    for i in range(0, len(buf), chunk_size):
+                        chunks.append(buf[i:i + chunk_size])
+                    return chunks
+
+                chunks = await loop.run_in_executor(None, _decode)
+                for chunk in chunks:
                     if abort_event.is_set():
                         break
-                    for resampled in resampler.resample(frame):
-                        pcm = bytes(resampled.planes[0])
-                        chunk_size = self._samples_per_frame * 2
-                        for i in range(0, len(pcm), chunk_size):
-                            if abort_event.is_set():
-                                break
-                            await self._queue.put(pcm[i:i + chunk_size])
-                            await asyncio.sleep(0.018)
+                    await self._queue.put(chunk)
             except Exception as e:
                 logger.warning("[voice_rtc] TTS feed error: %s", e)
 
