@@ -177,40 +177,48 @@ class VoiceRTCSession:
         self._tts_abort.clear()
 
     async def _run_and_speak(self, text: str) -> None:
-        """Send *text* to the LLM, stream response through TTS to the audio track."""
-        import json, uuid, urllib.request, urllib.error
+        """Send *text* to the LLM via /v1/runs, stream events, speak response."""
+        import json, urllib.request, urllib.error
 
         port = os.getenv("API_SERVER_PORT", "8642")
         base = f"http://localhost:{port}"
         api_key = os.getenv("API_SERVER_KEY", "")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "X-Hermes-Session-Id": self._session_id,
+        }
 
-        run_id = f"voice-{uuid.uuid4().hex[:12]}"
-
-        # POST /v1/runs
-        body = json.dumps({
-            "message": text,
-            "session_id": self._session_id,
-            "stream": True,
-        }).encode()
-        req = urllib.request.Request(
-            f"{base}/v1/runs",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "X-Hermes-Session-Id": self._session_id,
-                "Accept": "text/event-stream",
-            },
-            method="POST",
-        )
-
-        full_text = ""
+        # Step 1 — POST /v1/runs, get run_id back immediately
+        body = json.dumps({"input": text, "session_id": self._session_id}).encode()
+        req = urllib.request.Request(f"{base}/v1/runs", data=body, headers=headers, method="POST")
         try:
             resp = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: urllib.request.urlopen(req, timeout=60)
+                None, lambda: urllib.request.urlopen(req, timeout=10)
             )
-            # Parse SSE — collect full response text
-            for raw_line in resp:
+            run_data = json.loads(resp.read())
+            run_id = run_data.get("id") or run_data.get("run_id")
+        except Exception as e:
+            logger.warning("[voice_rtc] LLM run create failed: %s", e)
+            return
+
+        if not run_id:
+            logger.warning("[voice_rtc] No run_id in response: %s", run_data)
+            return
+
+        self._active_run_id = run_id
+
+        # Step 2 — GET /v1/runs/{run_id}/events, collect SSE text deltas
+        event_req = urllib.request.Request(
+            f"{base}/v1/runs/{run_id}/events",
+            headers={**headers, "Accept": "text/event-stream"},
+        )
+        full_text = ""
+        try:
+            event_resp = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: urllib.request.urlopen(event_req, timeout=120)
+            )
+            for raw_line in event_resp:
                 if self._tts_abort.is_set():
                     break
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -229,13 +237,14 @@ class VoiceRTCSession:
                 except Exception:
                     pass
         except Exception as e:
-            logger.warning("[voice_rtc] LLM run failed: %s", e)
+            logger.warning("[voice_rtc] LLM run events failed: %s", e)
             return
+        finally:
+            self._active_run_id = None
 
         if not full_text or self._tts_abort.is_set():
             return
 
-        # TTS → audio frames → outbound track
         await self._speak(full_text)
 
     async def _speak(self, text: str) -> None:
