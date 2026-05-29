@@ -94,14 +94,21 @@ class VoiceRTCSession:
                 kind = data.get("type")
 
                 if kind == "offer":
+                    offer_sdp = data["sdp"]
+                    # Log direction lines from offer so we can see sendonly/recvonly/sendrecv
+                    directions = [l for l in offer_sdp.splitlines() if l.startswith("a=") and any(d in l for d in ["sendonly","recvonly","sendrecv","inactive"])]
+                    logger.info("[voice_rtc] %s offer directions: %s", self._client_id, directions)
                     await self._pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=data["sdp"], type="offer")
+                        RTCSessionDescription(sdp=offer_sdp, type="offer")
                     )
                     answer = await self._pc.createAnswer()
                     await self._pc.setLocalDescription(answer)
+                    answer_sdp = self._pc.localDescription.sdp
+                    answer_directions = [l for l in answer_sdp.splitlines() if l.startswith("a=") and any(d in l for d in ["sendonly","recvonly","sendrecv","inactive"])]
+                    logger.info("[voice_rtc] %s answer directions: %s", self._client_id, answer_directions)
                     await ws.send_json({
                         "type": "answer",
-                        "sdp": self._pc.localDescription.sdp,
+                        "sdp": answer_sdp,
                     })
 
                 elif kind == "candidate":
@@ -358,17 +365,19 @@ def _make_tts_track():
             self._samples_per_frame = 960  # 20ms at 48kHz
 
         async def recv(self):
+            from fractions import Fraction
             try:
                 pcm = await asyncio.wait_for(self._queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
                 pcm = bytes(self._samples_per_frame * 2)  # silence
 
-            frame = _av.AudioFrame(format="s16", layout="mono", samples=len(pcm) // 2)
+            samples = len(pcm) // 2
+            frame = _av.AudioFrame(format="s16", layout="mono", samples=samples)
             frame.sample_rate = self._sample_rate
             frame.pts = self._pts
-            frame.time_base = f"1/{self._sample_rate}"
+            frame.time_base = Fraction(1, self._sample_rate)
             frame.planes[0].update(pcm)
-            self._pts += len(pcm) // 2
+            self._pts += samples
             return frame
 
         async def feed_audio_file(self, path: str, abort_event: asyncio.Event) -> None:
@@ -400,10 +409,10 @@ def _frame_to_pcm16(frame) -> bytes:
     """Convert an aiortc audio frame to raw 16-bit mono PCM bytes."""
     import av
     resampler = av.AudioResampler(format="s16", layout="mono", rate=frame.sample_rate)
-    resampled = resampler.resample(frame)
-    if resampled:
-        return bytes(resampled[0].planes[0])
-    return b""
+    out = b""
+    for resampled in resampler.resample(frame):
+        out += bytes(resampled.planes[0])
+    return out
 
 
 def _write_wav(path: str, pcm: bytes, sample_rate: int) -> None:
