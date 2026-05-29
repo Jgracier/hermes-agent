@@ -76,7 +76,7 @@ class VoiceRTCSession:
             "[voice_rtc] %s connection: %s", self._client_id, self._pc.connectionState))
 
         # Add outbound audio track so iPhone gets an audio channel
-        self._tts_track = _TTSAudioTrack()
+        self._tts_track = _make_tts_track()
         self._pc.addTrack(self._tts_track)
 
         try:
@@ -342,64 +342,54 @@ class _AudioSink:
 # Outbound TTS audio track
 # ------------------------------------------------------------------
 
-class _TTSAudioTrack:
-    """
-    aiortc MediaStreamTrack that streams TTS audio to the client.
-    Starts silent; feed_audio_file() decodes an mp3/wav and queues frames.
-    """
-    kind = "audio"
+def _make_tts_track():
+    """Factory that returns a proper MediaStreamTrack subclass instance."""
+    from aiortc import MediaStreamTrack
+    import av as _av
 
-    def __init__(self):
-        try:
-            from aiortc import MediaStreamTrack as _MST
-            # We can't easily subclass without aiortc internals, so we use
-            # MediaPlayer as a source and swap audio on demand.
-            # For now: use a queue-based custom track approach.
-        except ImportError:
-            pass
-        self._queue: asyncio.Queue = asyncio.Queue()
-        self._pts = 0
-        self._sample_rate = 48000
-        self._samples_per_frame = 960  # 20ms at 48kHz
+    class TTSAudioTrack(MediaStreamTrack):
+        kind = "audio"
 
-    async def recv(self):
-        """Called by aiortc to get the next audio frame."""
-        import av
-        from aiortc import MediaStreamTrack
-        try:
-            pcm = await asyncio.wait_for(self._queue.get(), timeout=0.02)
-        except asyncio.TimeoutError:
-            # silence frame
-            pcm = bytes(self._samples_per_frame * 2)
+        def __init__(self):
+            super().__init__()
+            self._queue = asyncio.Queue()
+            self._pts = 0
+            self._sample_rate = 48000
+            self._samples_per_frame = 960  # 20ms at 48kHz
 
-        frame = av.AudioFrame(format="s16", layout="mono", samples=len(pcm) // 2)
-        frame.sample_rate = self._sample_rate
-        frame.pts = self._pts
-        frame.time_base = f"1/{self._sample_rate}"
-        frame.planes[0].update(pcm)
-        self._pts += len(pcm) // 2
-        return frame
+        async def recv(self):
+            try:
+                pcm = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pcm = bytes(self._samples_per_frame * 2)  # silence
 
-    async def feed_audio_file(self, path: str, abort_event: asyncio.Event) -> None:
-        """Decode audio file and queue PCM frames for transmission."""
-        try:
-            import av
-            container = av.open(path)
-            resampler = av.AudioResampler(format="s16", layout="mono", rate=self._sample_rate)
-            for frame in container.decode(audio=0):
-                if abort_event.is_set():
-                    break
-                for resampled in resampler.resample(frame):
-                    pcm = bytes(resampled.planes[0])
-                    # split into 20ms chunks
-                    chunk_size = self._samples_per_frame * 2
-                    for i in range(0, len(pcm), chunk_size):
-                        if abort_event.is_set():
-                            break
-                        await self._queue.put(pcm[i:i + chunk_size])
-                        await asyncio.sleep(0.018)  # pace to ~real-time
-        except Exception as e:
-            logger.warning("[voice_rtc] TTS feed error: %s", e)
+            frame = _av.AudioFrame(format="s16", layout="mono", samples=len(pcm) // 2)
+            frame.sample_rate = self._sample_rate
+            frame.pts = self._pts
+            frame.time_base = f"1/{self._sample_rate}"
+            frame.planes[0].update(pcm)
+            self._pts += len(pcm) // 2
+            return frame
+
+        async def feed_audio_file(self, path: str, abort_event: asyncio.Event) -> None:
+            try:
+                container = _av.open(path)
+                resampler = _av.AudioResampler(format="s16", layout="mono", rate=self._sample_rate)
+                for frame in container.decode(audio=0):
+                    if abort_event.is_set():
+                        break
+                    for resampled in resampler.resample(frame):
+                        pcm = bytes(resampled.planes[0])
+                        chunk_size = self._samples_per_frame * 2
+                        for i in range(0, len(pcm), chunk_size):
+                            if abort_event.is_set():
+                                break
+                            await self._queue.put(pcm[i:i + chunk_size])
+                            await asyncio.sleep(0.018)
+            except Exception as e:
+                logger.warning("[voice_rtc] TTS feed error: %s", e)
+
+    return TTSAudioTrack()
 
 
 # ------------------------------------------------------------------
