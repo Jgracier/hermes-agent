@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # RMS silence thresholds — mirrors voice_mode.py defaults
 _SILENCE_RMS = 200
 _SPEECH_MIN_SECONDS = 0.4   # ignore clips shorter than this (noise)
-_SILENCE_SECONDS = 1.2      # silence after speech ends the utterance
+_SILENCE_SECONDS = 0.8      # silence after speech ends the utterance
 
 
 def _rms(pcm_bytes: bytes) -> float:
@@ -163,6 +163,12 @@ class VoiceRTCSession:
                 pass
 
         if not transcript:
+            return
+
+        # Filter whisper hallucinations on silence/noise
+        cleaned = transcript.strip().strip(".,!? \t")
+        if len(cleaned) < 3 or all(c in "., " for c in cleaned):
+            logger.debug("[voice_rtc] %s filtered noise transcript: %s", self._client_id, transcript)
             return
 
         logger.info("[voice_rtc] %s transcript: %s", self._client_id, transcript[:80])
