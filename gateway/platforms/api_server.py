@@ -1060,6 +1060,11 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from gateway.api_client_store import get_tailscale_host
+        _cap_host = get_tailscale_host() or self._host
+        _cap_base = f"http://{_cap_host}:{self._port}"
+        _cap_ws_base = f"ws://{_cap_host}:{self._port}"
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1108,9 +1113,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
-                "model_options": {"method": "GET", "path": "/api/model/options"},
-                "model_set": {"method": "POST", "path": "/api/model/set"},
-                "voice_ws": {"method": "GET", "path": "/api/voice/ws"},
+                "model_options": {"method": "GET", "path": "/api/model/options", "url": f"{_cap_base}/api/model/options"},
+                "model_set": {"method": "POST", "path": "/api/model/set", "url": f"{_cap_base}/api/model/set"},
+                "voice_ws": {"method": "GET", "path": "/api/voice/ws", "url": f"{_cap_ws_base}/api/voice/ws"},
             },
         })
 
