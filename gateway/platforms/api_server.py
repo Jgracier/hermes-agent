@@ -1108,6 +1108,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "model_options": {"method": "GET", "path": "/api/model/options"},
+                "model_set": {"method": "POST", "path": "/api/model/set"},
+                "voice_ws": {"method": "GET", "path": "/api/voice/ws"},
             },
         })
 
@@ -3490,10 +3493,6 @@ class APIServerAdapter(BasePlatformAdapter):
             "api_base_url": f"{base}/v1",
             "api_key": api_key,
             "client_id": result["client_id"],
-            "dashboard_base_url": base,
-            "dashboard_model_options_url": f"{base}/api/model/options",
-            "dashboard_model_set_url": f"{base}/api/model/set",
-            "voice_ws_url": f"ws://{host}:{self._port}/api/voice/ws",
         })
 
     async def _handle_voice_ws(self, request: "web.Request") -> "web.Response":
