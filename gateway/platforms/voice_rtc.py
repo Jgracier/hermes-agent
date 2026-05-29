@@ -208,37 +208,44 @@ class VoiceRTCSession:
 
         self._active_run_id = run_id
 
-        # Step 2 — GET /v1/runs/{run_id}/events, collect SSE text deltas
+        # Step 2 — GET /v1/runs/{run_id}/events, collect SSE text deltas.
+        # Run entirely in executor — SSE iteration is blocking I/O and must
+        # not touch the asyncio event loop directly.
         event_req = urllib.request.Request(
             f"{base}/v1/runs/{run_id}/events",
             headers={**headers, "Accept": "text/event-stream"},
         )
+        abort = self._tts_abort
+
+        def _consume_events() -> str:
+            text = ""
+            try:
+                resp = urllib.request.urlopen(event_req, timeout=120)
+                for raw_line in resp:
+                    if abort.is_set():
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(payload)
+                        delta = (event.get("choices", [{}])[0]
+                                 .get("delta", {})
+                                 .get("content", ""))
+                        if delta:
+                            text += delta
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning("[voice_rtc] LLM run events failed: %s", e)
+            return text
+
         full_text = ""
         try:
-            event_resp = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: urllib.request.urlopen(event_req, timeout=120)
-            )
-            for raw_line in event_resp:
-                if self._tts_abort.is_set():
-                    break
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    event = json.loads(payload)
-                    delta = (event.get("choices", [{}])[0]
-                             .get("delta", {})
-                             .get("content", ""))
-                    if delta:
-                        full_text += delta
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.warning("[voice_rtc] LLM run events failed: %s", e)
-            return
+            full_text = await asyncio.get_event_loop().run_in_executor(None, _consume_events)
         finally:
             self._active_run_id = None
 
