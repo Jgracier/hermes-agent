@@ -246,7 +246,9 @@ class VoiceRTCSession:
         self._active_run_id = None
 
         logger.info("[voice_rtc] %s LLM response (%d chars): %s", self._client_id, len(full_text), full_text[:60])
-        if not full_text or self._tts_abort.is_set():
+        if not full_text or self._tts_abort.is_set() or self._stop_event.is_set():
+            if self._stop_event.is_set():
+                logger.warning("[voice_rtc] %s session closed before TTS — discarding response", self._client_id)
             return
 
         await self._speak(full_text)
@@ -256,6 +258,7 @@ class VoiceRTCSession:
         if not text.strip() or self._tts_abort.is_set():
             return
 
+        logger.info("[voice_rtc] %s TTS generating (%d chars)", self._client_id, len(text))
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tmp_path = f.name
 
@@ -264,9 +267,14 @@ class VoiceRTCSession:
                 None, _tts, text, tmp_path
             )
             if not result or self._tts_abort.is_set():
+                logger.warning("[voice_rtc] %s TTS failed or aborted (result=%s)", self._client_id, result)
                 return
+            logger.info("[voice_rtc] %s TTS done, feeding to audio track", self._client_id)
             if self._tts_track:
                 await self._tts_track.feed_audio_file(tmp_path, self._tts_abort)
+                logger.info("[voice_rtc] %s audio feed complete", self._client_id)
+            else:
+                logger.warning("[voice_rtc] %s no tts_track to send audio to", self._client_id)
         finally:
             try:
                 os.unlink(tmp_path)
