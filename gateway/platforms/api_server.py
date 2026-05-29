@@ -1095,6 +1095,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "cors": bool(self._cors_origins),
                 "client_enrollment": True,
                 "model_picker": True,
+                "voice_webrtc": True,
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
@@ -3492,7 +3493,46 @@ class APIServerAdapter(BasePlatformAdapter):
             "dashboard_base_url": base,
             "dashboard_model_options_url": f"{base}/api/model/options",
             "dashboard_model_set_url": f"{base}/api/model/set",
+            "voice_ws_url": f"ws://{host}:{self._port}/api/voice/ws",
         })
+
+    async def _handle_voice_ws(self, request: "web.Request") -> "web.Response":
+        """GET /api/voice/ws — WebSocket signaling for WebRTC voice sessions.
+
+        Authenticated via ?token=<api_key> query param (WebSocket upgrades
+        cannot carry Authorization headers from native clients).
+
+        Protocol (JSON messages over WebSocket):
+          client → server: {"type":"offer","sdp":"..."}
+          server → client: {"type":"answer","sdp":"..."}
+          client → server: {"type":"candidate","candidate":{...}}
+          client → server: {"type":"close"}
+        """
+        # Auth via query param — WS upgrade can't set Authorization header
+        token = request.rel_url.query.get("token", "").strip()
+        if not token or not self._client_store.verify_client_key(token):
+            return web.Response(status=401, text="Unauthorized")
+
+        client_id = request.rel_url.query.get("client_id", "unknown")
+        session_id = request.rel_url.query.get("session_id", "").strip() or None
+
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        logger.info("[%s] Voice WebSocket connected: client=%s", self.name, client_id)
+
+        try:
+            from gateway.platforms.voice_rtc import VoiceRTCSession
+            session = VoiceRTCSession(self, client_id, session_id)
+            await session.run(ws)
+        except Exception:
+            logger.exception("[%s] Voice WebSocket error: client=%s", self.name, client_id)
+        finally:
+            if not ws.closed:
+                await ws.close()
+            logger.info("[%s] Voice WebSocket closed: client=%s", self.name, client_id)
+
+        return ws
 
     async def _handle_model_options(self, request: "web.Request") -> "web.Response":
         """GET /api/model/options — return available providers and model lists.
@@ -3669,6 +3709,8 @@ class APIServerAdapter(BasePlatformAdapter):
             # Model picker — authenticated, mirrors dashboard /api/model/* endpoints
             self._app.router.add_get("/api/model/options", self._handle_model_options)
             self._app.router.add_post("/api/model/set", self._handle_model_set)
+            # WebRTC voice — authenticated WebSocket signaling + full-duplex audio
+            self._app.router.add_get("/api/voice/ws", self._handle_voice_ws)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
