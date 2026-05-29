@@ -20,10 +20,14 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# RMS silence thresholds — mirrors voice_mode.py defaults
-_SILENCE_RMS = 200
+# Reuse RMS threshold from voice_mode.py — single source of truth
+try:
+    from tools.voice_mode import SILENCE_RMS_THRESHOLD as _SILENCE_RMS
+except ImportError:
+    _SILENCE_RMS = 200
+
 _SPEECH_MIN_SECONDS = 0.4   # ignore clips shorter than this (noise)
-_SILENCE_SECONDS = 0.8      # silence after speech ends the utterance
+_SILENCE_SECONDS = 0.8      # intentionally shorter than voice_mode's 3.0s — chat needs fast turn-taking
 
 
 def _rms(pcm_bytes: bytes) -> float:
@@ -201,8 +205,13 @@ class VoiceRTCSession:
         self._tts_abort.clear()
 
     async def _run_and_speak(self, text: str) -> None:
-        """Send *text* to LLM via /v1/chat/completions streaming — single request, no race."""
-        import json, urllib.request, urllib.error
+        """Stream LLM response sentence by sentence — TTS each sentence as it arrives.
+
+        Overlap: sentence N is playing while sentence N+1 is being TTS'd and
+        sentence N+2 is still being generated. First audio plays ~2s after
+        LLM starts responding instead of waiting for the full response.
+        """
+        import json, urllib.request, queue as _queue, re
 
         port = os.getenv("API_SERVER_PORT", "8642")
         base = f"http://localhost:{port}"
@@ -221,18 +230,18 @@ class VoiceRTCSession:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "X-Hermes-Session-Id": self._session_id,
-                "Accept": "text/event-stream",
             },
             method="POST",
         )
 
         abort = self._tts_abort
+        sentence_q: "_queue.Queue[str | None]" = _queue.Queue()
 
-        def _stream_response() -> str:
-            collected = ""
+        def _stream_sentences() -> None:
+            """Stream SSE in thread, fire complete sentences onto sentence_q."""
+            buf = ""
             try:
                 resp = urllib.request.urlopen(req, timeout=120)
-                logger.info("[voice_rtc] %s SSE stream opened", self._client_id)
                 for raw_line in resp:
                     if abort.is_set():
                         break
@@ -243,35 +252,50 @@ class VoiceRTCSession:
                     if payload == "[DONE]":
                         break
                     try:
-                        event = json.loads(payload)
-                        delta = (event.get("choices", [{}])[0]
-                                 .get("delta", {})
-                                 .get("content", ""))
+                        delta = (json.loads(payload).get("choices", [{}])[0]
+                                 .get("delta", {}).get("content", ""))
                         if delta:
-                            collected += delta
+                            buf += delta
+                            # Emit on sentence boundaries (.  !  ? followed by space or end)
+                            while True:
+                                m = re.search(r'(?<=[.!?])\s+', buf)
+                                if not m:
+                                    break
+                                sentence = buf[:m.start()].strip()
+                                buf = buf[m.end():]
+                                if sentence:
+                                    sentence_q.put(sentence)
                     except Exception:
                         pass
             except Exception as e:
                 logger.warning("[voice_rtc] LLM stream failed: %s", e)
-            return collected
+            finally:
+                if buf.strip():
+                    sentence_q.put(buf.strip())
+                sentence_q.put(None)  # sentinel
 
-        full_text = await asyncio.get_event_loop().run_in_executor(None, _stream_response)
-        self._active_run_id = None
+        loop = asyncio.get_event_loop()
+        stream_task = loop.run_in_executor(None, _stream_sentences)
 
-        logger.info("[voice_rtc] %s LLM response (%d chars): %s", self._client_id, len(full_text), full_text[:60])
-        if not full_text or self._tts_abort.is_set() or self._stop_event.is_set():
-            if self._stop_event.is_set():
-                logger.warning("[voice_rtc] %s session closed before TTS — discarding response", self._client_id)
-            return
+        # Consume and speak each sentence as it arrives — overlaps with LLM generation
+        while not abort.is_set() and not self._stop_event.is_set():
+            try:
+                sentence = await loop.run_in_executor(
+                    None, lambda: sentence_q.get(timeout=0.05)
+                )
+            except Exception:
+                continue
+            if sentence is None:
+                break
+            await self._speak(sentence)
 
-        await self._speak(full_text)
+        await stream_task
 
     async def _speak(self, text: str) -> None:
-        """Convert *text* to audio and feed frames to the outbound track."""
+        """TTS one sentence and feed frames to the outbound audio track."""
         if not text.strip() or self._tts_abort.is_set():
             return
 
-        logger.info("[voice_rtc] %s TTS generating (%d chars)", self._client_id, len(text))
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             tmp_path = f.name
 
@@ -280,19 +304,15 @@ class VoiceRTCSession:
                 None, _tts, text, tmp_path
             )
             if not result or self._tts_abort.is_set():
-                logger.warning("[voice_rtc] %s TTS failed or aborted (result=%s)", self._client_id, result)
                 return
-            logger.info("[voice_rtc] %s TTS done, feeding to audio track", self._client_id)
             if self._tts_track:
                 await self._tts_track.feed_audio_file(tmp_path, self._tts_abort)
-                logger.info("[voice_rtc] %s audio feed complete", self._client_id)
-            else:
-                logger.warning("[voice_rtc] %s no tts_track to send audio to", self._client_id)
         finally:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
 
 
 # ------------------------------------------------------------------
