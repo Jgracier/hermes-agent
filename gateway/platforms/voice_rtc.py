@@ -161,7 +161,12 @@ class VoiceRTCSession:
         logger.info("[voice_rtc] %s transcript: %s", self._client_id, transcript[:80])
 
         # LLM run → TTS → stream audio back
-        asyncio.ensure_future(self._run_and_speak(transcript))
+        async def _safe():
+            try:
+                await self._run_and_speak(transcript)
+            except Exception:
+                logger.exception("[voice_rtc] %s _run_and_speak unhandled error", self._client_id)
+        asyncio.ensure_future(_safe())
 
     async def _interrupt(self) -> None:
         """Cancel any in-flight LLM run and abort TTS playback."""
@@ -189,6 +194,7 @@ class VoiceRTCSession:
         port = os.getenv("API_SERVER_PORT", "8642")
         base = f"http://localhost:{port}"
         api_key = os.getenv("API_SERVER_KEY", "")
+        logger.info("[voice_rtc] %s starting LLM run for: %s", self._client_id, text[:40])
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -213,6 +219,7 @@ class VoiceRTCSession:
             return
 
         self._active_run_id = run_id
+        logger.info("[voice_rtc] %s run created: %s", self._client_id, run_id)
 
         # Step 2 — GET /v1/runs/{run_id}/events, collect SSE text deltas.
         # Run entirely in executor — SSE iteration is blocking I/O and must
@@ -225,28 +232,36 @@ class VoiceRTCSession:
 
         def _consume_events() -> str:
             text = ""
-            try:
-                resp = urllib.request.urlopen(event_req, timeout=120)
-                for raw_line in resp:
-                    if abort.is_set():
+            # Retry a few times — the run may not have started streaming yet
+            for attempt in range(3):
+                try:
+                    resp = urllib.request.urlopen(event_req, timeout=120)
+                    for raw_line in resp:
+                        if abort.is_set():
+                            break
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(payload)
+                            delta = (event.get("choices", [{}])[0]
+                                     .get("delta", {})
+                                     .get("content", ""))
+                            if delta:
+                                text += delta
+                        except Exception:
+                            pass
+                    if text:
                         break
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(payload)
-                        delta = (event.get("choices", [{}])[0]
-                                 .get("delta", {})
-                                 .get("content", ""))
-                        if delta:
-                            text += delta
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning("[voice_rtc] LLM run events failed: %s", e)
+                    import time as _time
+                    _time.sleep(0.5)
+                except Exception as e:
+                    logger.warning("[voice_rtc] LLM run events attempt %d failed: %s", attempt + 1, e)
+                    import time as _time
+                    _time.sleep(0.5)
             return text
 
         full_text = ""
@@ -255,6 +270,7 @@ class VoiceRTCSession:
         finally:
             self._active_run_id = None
 
+        logger.info("[voice_rtc] %s LLM response (%d chars): %s", self._client_id, len(full_text), full_text[:60])
         if not full_text or self._tts_abort.is_set():
             return
 
