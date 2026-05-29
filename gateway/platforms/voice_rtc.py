@@ -63,8 +63,8 @@ class VoiceRTCSession:
     async def run(self, ws) -> None:
         """Drive signaling over *ws* (aiohttp WebSocketResponse)."""
         try:
-            from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
-            from aiortc.contrib.media import MediaBlackhole
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+            from aiortc.sdp import candidate_from_sdp
         except ImportError:
             await ws.send_json({"error": "aiortc not installed on server"})
             return
@@ -75,7 +75,7 @@ class VoiceRTCSession:
         self._pc.on("connectionstatechange", lambda: logger.info(
             "[voice_rtc] %s connection: %s", self._client_id, self._pc.connectionState))
 
-        # Add outbound silent audio track so iPhone gets an audio channel
+        # Add outbound audio track so iPhone gets an audio channel
         self._tts_track = _TTSAudioTrack()
         self._pc.addTrack(self._tts_track)
 
@@ -105,11 +105,17 @@ class VoiceRTCSession:
                     })
 
                 elif kind == "candidate":
-                    from aiortc.sdp import candidate_from_aioice
-                    from aioice import Candidate
+                    # iOS sends {"type":"candidate","candidate":{"candidate":"candidate:...","sdpMid":"0","sdpMLineIndex":0}}
                     c = data.get("candidate", {})
-                    if c:
-                        await self._pc.addIceCandidate(data["candidate"])
+                    sdp_str = c.get("candidate", "") if isinstance(c, dict) else ""
+                    if sdp_str:
+                        try:
+                            candidate = candidate_from_sdp(sdp_str.replace("candidate:", "", 1))
+                            candidate.sdpMid = c.get("sdpMid")
+                            candidate.sdpMLineIndex = c.get("sdpMLineIndex")
+                            await self._pc.addIceCandidate(candidate)
+                        except Exception as e:
+                            logger.debug("[voice_rtc] ICE candidate error: %s", e)
 
                 elif kind == "close":
                     break
