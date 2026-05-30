@@ -253,15 +253,60 @@ class VoiceRTCSession:
 
         sentence_q = chunk_q  # alias so rest of code is unchanged
 
-        def _tts_to_chunks(sentence: str) -> List[bytes]:
-            """TTS one sentence → list of raw PCM chunks, ready to queue."""
+        def _trim_silence(pcm: bytes, sample_rate: int = 48000,
+                           thresh: int = 80, max_silence_ms: int = 80) -> bytes:
+            """Trim leading/trailing silence and reduce mid-audio silence gaps.
+
+            Edge TTS inserts ~950ms of silence between sentences and at boundaries.
+            Reduce any silence run > max_silence_ms to max_silence_ms.
+            """
+            import struct as _struct
+            if not pcm:
+                return pcm
+            n = len(pcm) // 2
+            samples = list(_struct.unpack_from(f"<{n}h", pcm))
+            max_silence_samps = int(sample_rate * max_silence_ms / 1000)
+
+            # Trim leading silence
+            start = 0
+            while start < n and abs(samples[start]) < thresh:
+                start += 1
+            start = max(0, start - max_silence_samps)
+
+            # Trim trailing silence
+            end = n - 1
+            while end > start and abs(samples[end]) < thresh:
+                end -= 1
+            end = min(n - 1, end + max_silence_samps)
+
+            # Reduce mid-audio silence runs > max_silence_ms
+            out = []
+            i = start
+            while i <= end:
+                if abs(samples[i]) < thresh:
+                    run_start = i
+                    while i <= end and abs(samples[i]) < thresh:
+                        i += 1
+                    run_len = i - run_start
+                    # Keep at most max_silence_samps of silence
+                    keep = min(run_len, max_silence_samps)
+                    out.extend(samples[run_start:run_start + keep])
+                else:
+                    out.append(samples[i])
+                    i += 1
+
+            if not out:
+                return b""
+            return _struct.pack(f"<{len(out)}h", *out)
+
+        def _tts_to_chunks(text: str) -> List[bytes]:
+            """TTS text → silence-trimmed PCM chunks at 20ms each."""
             import av as _av
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tmp = f.name
             try:
-                if not _tts(sentence, tmp):
+                if not _tts(text, tmp):
                     return []
-                chunks = []
                 container = _av.open(tmp)
                 resampler = _av.AudioResampler(format="s16", layout="mono", rate=48000)
                 buf = b""
@@ -270,10 +315,9 @@ class VoiceRTCSession:
                         buf += bytes(r.planes[0])
                 for r in resampler.resample(None):
                     buf += bytes(r.planes[0])
+                buf = _trim_silence(buf)
                 chunk_size = 960 * 2  # 20ms at 48kHz, 16-bit mono
-                for i in range(0, len(buf), chunk_size):
-                    chunks.append(buf[i:i + chunk_size])
-                return chunks
+                return [buf[i:i + chunk_size] for i in range(0, len(buf), chunk_size)]
             except Exception as e:
                 logger.warning("[voice_rtc] TTS chunk error: %s", e)
                 return []
