@@ -70,14 +70,16 @@ class VoiceRTCSession:
             await ws.send_json({"error": "aiortc not installed on server"})
             return
 
+        self._ws = ws  # stored for sending TTS audio as binary
+
         self._pc = RTCPeerConnection()
         sink = _AudioSink(self._on_utterance)
         self._pc.on("track", lambda track: self._on_track(track, sink))
         self._pc.on("connectionstatechange", lambda: logger.info(
             "[voice_rtc] %s state: %s", self._client_id, self._pc.connectionState))
 
-        self._tts_track = _make_tts_track()
-        self._pc.addTrack(self._tts_track)
+        # No outbound WebRTC audio track — TTS audio sent as WebSocket binary
+        # which iOS plays natively via AVAudioPlayer (no codec/timing issues)
 
         try:
             async for msg in ws:
@@ -167,6 +169,12 @@ class VoiceRTCSession:
 
     async def _interrupt(self) -> None:
         self._tts_abort.set()
+        # Signal app to stop playback immediately
+        if hasattr(self, "_ws") and self._ws and not self._ws.closed:
+            try:
+                await self._ws.send_json({"type": "tts_interrupt"})
+            except Exception:
+                pass
         await asyncio.sleep(0)
         self._tts_abort.clear()
 
@@ -299,28 +307,18 @@ class VoiceRTCSession:
                 return b""
             return _struct.pack(f"<{len(out)}h", *out)
 
-        def _tts_to_chunks(text: str) -> List[bytes]:
-            """TTS text → silence-trimmed PCM chunks at 20ms each."""
-            import av as _av
+        def _tts_to_chunks(text: str) -> bytes:
+            """TTS text → raw MP3 bytes for direct WebSocket delivery."""
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 tmp = f.name
             try:
                 if not _tts(text, tmp):
-                    return []
-                container = _av.open(tmp)
-                resampler = _av.AudioResampler(format="s16", layout="mono", rate=48000)
-                buf = b""
-                for frame in container.decode(audio=0):
-                    for r in resampler.resample(frame):
-                        buf += bytes(r.planes[0])
-                for r in resampler.resample(None):
-                    buf += bytes(r.planes[0])
-                buf = _trim_silence(buf)
-                chunk_size = 960 * 2  # 20ms at 48kHz, 16-bit mono
-                return [buf[i:i + chunk_size] for i in range(0, len(buf), chunk_size)]
+                    return b""
+                with open(tmp, "rb") as f:
+                    return f.read()
             except Exception as e:
-                logger.warning("[voice_rtc] TTS chunk error: %s", e)
-                return []
+                logger.warning("[voice_rtc] TTS error: %s", e)
+                return b""
             finally:
                 try:
                     os.unlink(tmp)
@@ -358,24 +356,27 @@ class VoiceRTCSession:
         if len(self._history) > 40:
             self._history = self._history[-40:]
 
-        logger.info("[voice_rtc] %s response: %d sentences, queuing audio", self._client_id, len(tts_tasks))
-        total_chunks = 0
-        # Feed audio in order — each task finishes in parallel, we drain in sequence
+        logger.info("[voice_rtc] %s response: %d chunks, sending audio", self._client_id, len(tts_tasks))
+        # Send each TTS chunk as WebSocket binary — iOS plays with AVAudioPlayer.
+        # No WebRTC audio track encoding/timing issues.
         for task in tts_tasks:
             if abort.is_set() or self._stop_event.is_set():
                 break
-            chunks = await task
-            if chunks and self._tts_track:
-                for chunk in chunks:
-                    if abort.is_set():
-                        break
-                    self._tts_track.put_chunk_nowait(chunk)
-                    total_chunks += 1
+            mp3_bytes = await task
+            if mp3_bytes and not self._ws.closed:
+                try:
+                    # Signal start so app can clear any previous playback
+                    await self._ws.send_json({"type": "tts_chunk"})
+                    await self._ws.send_bytes(mp3_bytes)
+                except Exception as e:
+                    logger.warning("[voice_rtc] WS audio send failed: %s", e)
+                    break
 
-        # Mute VAD for estimated playback duration + 0.5s buffer for echo tail
-        if total_chunks > 0:
-            playback_seconds = total_chunks * 0.02  # 20ms per chunk
-            self._tts_mute_until = time.time() + playback_seconds + 0.5
+        if not abort.is_set() and not self._ws.closed:
+            try:
+                await self._ws.send_json({"type": "tts_done"})
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------
