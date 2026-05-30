@@ -70,7 +70,7 @@ class VoiceRTCSession:
             await ws.send_json({"error": "aiortc not installed on server"})
             return
 
-        self._ws = ws  # stored for sending TTS audio as binary
+        self._ws = ws
 
         self._pc = RTCPeerConnection()
         sink = _AudioSink(self._on_utterance)
@@ -78,8 +78,12 @@ class VoiceRTCSession:
         self._pc.on("connectionstatechange", lambda: logger.info(
             "[voice_rtc] %s state: %s", self._client_id, self._pc.connectionState))
 
-        # No outbound WebRTC audio track — TTS audio sent as WebSocket binary
-        # which iOS plays natively via AVAudioPlayer (no codec/timing issues)
+        # Outbound audio: silent track initially, swapped per-response via
+        # RTCRtpSender.replaceTrack() with a MediaPlayer-backed track.
+        # MediaPlayer uses a background thread + aiortc's own clock — no asyncio
+        # timing jitter. Opus encoding at correct rate is handled by aiortc.
+        self._silent_track = _make_silent_track()
+        self._sender = self._pc.addTrack(self._silent_track)
 
         try:
             async for msg in ws:
@@ -169,10 +173,10 @@ class VoiceRTCSession:
 
     async def _interrupt(self) -> None:
         self._tts_abort.set()
-        # Signal app to stop playback immediately
-        if hasattr(self, "_ws") and self._ws and not self._ws.closed:
+        # Swap back to silent track immediately to cut outbound audio
+        if hasattr(self, "_sender") and self._sender and hasattr(self, "_silent_track"):
             try:
-                await self._ws.send_json({"type": "tts_interrupt"})
+                await self._sender.replaceTrack(self._silent_track)
             except Exception:
                 pass
         await asyncio.sleep(0)
@@ -356,27 +360,49 @@ class VoiceRTCSession:
         if len(self._history) > 40:
             self._history = self._history[-40:]
 
-        logger.info("[voice_rtc] %s response: %d chunks, sending audio", self._client_id, len(tts_tasks))
-        # Send each TTS chunk as WebSocket binary — iOS plays with AVAudioPlayer.
-        # No WebRTC audio track encoding/timing issues.
+        logger.info("[voice_rtc] %s response: %d chunks, playing via MediaPlayer", self._client_id, len(tts_tasks))
+        # Play each TTS chunk via MediaPlayer → replaceTrack().
+        # MediaPlayer uses a background thread for frame timing — no asyncio jitter.
+        # Opus encoding at the correct rate is handled entirely by aiortc.
+        from aiortc.contrib.media import MediaPlayer
+
         for task in tts_tasks:
             if abort.is_set() or self._stop_event.is_set():
                 break
             mp3_bytes = await task
-            if mp3_bytes and not self._ws.closed:
-                try:
-                    # Signal start so app can clear any previous playback
-                    await self._ws.send_json({"type": "tts_chunk"})
-                    await self._ws.send_bytes(mp3_bytes)
-                except Exception as e:
-                    logger.warning("[voice_rtc] WS audio send failed: %s", e)
-                    break
+            if not mp3_bytes:
+                continue
 
-        if not abort.is_set() and not self._ws.closed:
+            # Write to temp file for MediaPlayer
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(mp3_bytes)
+                tmp_mp3 = f.name
+
             try:
-                await self._ws.send_json({"type": "tts_done"})
-            except Exception:
-                pass
+                player = MediaPlayer(tmp_mp3)
+                if player.audio is None:
+                    continue
+
+                # Swap in the player track — aiortc handles timing/encoding
+                await self._sender.replaceTrack(player.audio)
+
+                # Wait for playback to finish (duration from file)
+                import av as _av
+                container = _av.open(tmp_mp3)
+                duration = float(container.duration) / 1_000_000 if container.duration else 3.0
+                container.close()
+
+                await asyncio.sleep(duration + 0.1)  # small tail buffer
+
+                if not abort.is_set():
+                    await self._sender.replaceTrack(self._silent_track)
+            except Exception as e:
+                logger.warning("[voice_rtc] MediaPlayer error: %s", e)
+            finally:
+                try:
+                    os.unlink(tmp_mp3)
+                except OSError:
+                    pass
 
 
 # ------------------------------------------------------------------
@@ -448,8 +474,38 @@ class _AudioSink:
 
 
 # ------------------------------------------------------------------
-# Outbound TTS audio track
+# Outbound audio tracks
 # ------------------------------------------------------------------
+
+def _make_silent_track():
+    """Minimal silent audio track — placeholder between TTS responses."""
+    from aiortc import MediaStreamTrack
+    import av as _av
+
+    class SilentTrack(MediaStreamTrack):
+        kind = "audio"
+
+        def __init__(self):
+            super().__init__()
+            self._pts = 0
+            self._start = time.monotonic()
+
+        async def recv(self):
+            # Pace at real-time rate so aiortc doesn't flood
+            due = self._start + (self._pts / 48000)
+            wait = due - time.monotonic()
+            if wait > 0.001:
+                await asyncio.sleep(wait)
+            frame = _av.AudioFrame(format="s16", layout="mono", samples=960)
+            frame.sample_rate = 48000
+            frame.pts = self._pts
+            frame.time_base = Fraction(1, 48000)
+            frame.planes[0].update(bytes(960 * 2))
+            self._pts += 960
+            return frame
+
+    return SilentTrack()
+
 
 def _make_tts_track():
     from aiortc import MediaStreamTrack
