@@ -1116,6 +1116,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": {"method": "GET", "path": "/api/model/options", "url": f"{_cap_base}/api/model/options"},
                 "model_set": {"method": "POST", "path": "/api/model/set", "url": f"{_cap_base}/api/model/set"},
                 "voice_ws": {"method": "GET", "path": "/api/voice/ws", "url": f"{_cap_ws_base}/api/voice/ws"},
+                "voice_config": {"method": "GET", "path": "/api/voice/config", "url": f"{_cap_base}/api/voice/config"},
+                "voice_config_set": {"method": "POST", "path": "/api/voice/config", "url": f"{_cap_base}/api/voice/config"},
             },
         })
 
@@ -3500,6 +3502,82 @@ class APIServerAdapter(BasePlatformAdapter):
             "client_id": result["client_id"],
         })
 
+    async def _handle_voice_config_get(self, request: "web.Request") -> "web.Response":
+        """GET /api/voice/config — return current STT and TTS configuration."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.tts_tool import _load_tts_config, _get_provider as _get_tts_provider
+            from tools.transcription_tools import _load_stt_config, _get_provider as _get_stt_provider
+            tts_cfg = _load_tts_config()
+            stt_cfg = _load_stt_config()
+            tts_provider = _get_tts_provider(tts_cfg)
+            stt_provider = _get_stt_provider(stt_cfg)
+            edge_cfg = tts_cfg.get("edge", {})
+            local_cfg = stt_cfg.get("local", {})
+            return web.json_response({
+                "stt": {
+                    "provider": stt_provider,
+                    "model": local_cfg.get("model", "base") if stt_provider == "local" else stt_cfg.get(stt_provider, {}).get("model", ""),
+                    "available": ["local", "groq", "openai", "mistral", "xai"],
+                    "default": "local",
+                },
+                "tts": {
+                    "provider": tts_provider,
+                    "voice": edge_cfg.get("voice", "en-US-AriaNeural") if tts_provider == "edge" else tts_cfg.get(tts_provider, {}).get("voice", tts_cfg.get(tts_provider, {}).get("voice_id", "")),
+                    "available": ["edge", "piper", "kittentts", "neutts", "openai", "elevenlabs", "gemini", "mistral", "xai", "minimax"],
+                    "default": "edge",
+                },
+            })
+        except Exception:
+            logger.exception("[%s] GET /api/voice/config failed", self.name)
+            return web.json_response({"error": "failed to read voice config"}, status=500)
+
+    async def _handle_voice_config_set(self, request: "web.Request") -> "web.Response":
+        """POST /api/voice/config — update STT and/or TTS provider settings.
+
+        Body (all fields optional):
+          {"stt": {"provider": "local", "model": "base"},
+           "tts": {"provider": "edge", "voice": "en-US-AriaNeural"}}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        try:
+            from hermes_cli.config import load_config, save_config
+            cfg = load_config()
+
+            stt_body = body.get("stt", {})
+            if stt_body:
+                stt_section = cfg.setdefault("stt", {})
+                if "provider" in stt_body:
+                    stt_section["provider"] = str(stt_body["provider"]).strip()
+                if "model" in stt_body:
+                    provider = stt_body.get("provider", stt_section.get("provider", "local"))
+                    stt_section.setdefault(provider, {})["model"] = str(stt_body["model"]).strip()
+
+            tts_body = body.get("tts", {})
+            if tts_body:
+                tts_section = cfg.setdefault("tts", {})
+                if "provider" in tts_body:
+                    tts_section["provider"] = str(tts_body["provider"]).strip()
+                if "voice" in tts_body:
+                    provider = tts_body.get("provider", tts_section.get("provider", "edge"))
+                    voice_key = "voice_id" if provider in ("elevenlabs", "xai") else "voice"
+                    tts_section.setdefault(provider, {})[voice_key] = str(tts_body["voice"]).strip()
+
+            save_config(cfg)
+            logger.info("[%s] Voice config updated: %s", self.name, body)
+            return web.json_response({"ok": True})
+        except Exception:
+            logger.exception("[%s] POST /api/voice/config failed", self.name)
+            return web.json_response({"error": "failed to save voice config"}, status=500)
+
     async def _handle_voice_ws(self, request: "web.Request") -> "web.Response":
         """GET /api/voice/ws — WebSocket signaling for WebRTC voice sessions.
 
@@ -3713,6 +3791,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Model picker — authenticated, mirrors dashboard /api/model/* endpoints
             self._app.router.add_get("/api/model/options", self._handle_model_options)
             self._app.router.add_post("/api/model/set", self._handle_model_set)
+            # Voice config — read/write STT and TTS provider settings
+            self._app.router.add_get("/api/voice/config", self._handle_voice_config_get)
+            self._app.router.add_post("/api/voice/config", self._handle_voice_config_set)
             # WebRTC voice — authenticated WebSocket signaling + full-duplex audio
             self._app.router.add_get("/api/voice/ws", self._handle_voice_ws)
             # Start background sweep to clean up orphaned (unconsumed) run streams

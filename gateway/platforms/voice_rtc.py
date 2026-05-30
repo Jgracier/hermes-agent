@@ -182,6 +182,7 @@ class VoiceRTCSession:
         url = f"http://localhost:{port}/v1/chat/completions"
         abort = self._tts_abort
         loop = asyncio.get_event_loop()
+        logger.info("[voice_rtc] %s LLM start: %s", self._client_id, text[:50])
 
         # Maintain conversation history for multi-turn context
         self._history.append({"role": "user", "content": text})
@@ -239,7 +240,8 @@ class VoiceRTCSession:
             finally:
                 if buf.strip():
                     loop.call_soon_threadsafe(sentence_q.put_nowait, buf.strip())
-                loop.call_soon_threadsafe(sentence_q.put_nowait, None)  # sentinel
+                loop.call_soon_threadsafe(sentence_q.put_nowait, None)
+                loop.call_soon_threadsafe(logger.info, "[voice_rtc] LLM stream complete")
 
         def _tts_to_chunks(sentence: str) -> List[bytes]:
             """TTS one sentence → list of raw PCM chunks, ready to queue."""
@@ -302,6 +304,7 @@ class VoiceRTCSession:
         if len(self._history) > 40:
             self._history = self._history[-40:]
 
+        logger.info("[voice_rtc] %s response: %d sentences, queuing audio", self._client_id, len(tts_tasks))
         # Feed audio in order — each task finishes in parallel, we drain in sequence
         for task in tts_tasks:
             if abort.is_set() or self._stop_event.is_set():
