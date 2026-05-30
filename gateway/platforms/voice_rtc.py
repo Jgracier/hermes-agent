@@ -369,7 +369,7 @@ class VoiceRTCSession:
                 for chunk in chunks:
                     if abort.is_set():
                         break
-                    await self._tts_track.put_chunk(chunk)
+                    self._tts_track.put_chunk_nowait(chunk)
                     total_chunks += 1
 
         # Mute VAD for estimated playback duration + 0.5s buffer for echo tail
@@ -464,15 +464,16 @@ def _make_tts_track():
             self._sample_rate = 48000
             self._samples_per_frame = 960  # 20ms at 48kHz
 
-        async def put_chunk(self, pcm: bytes) -> None:
-            await self._queue.put(pcm)
+        def put_chunk_nowait(self, pcm: bytes) -> None:
+            """Non-blocking put — called from audio feeding loop."""
+            self._queue.put_nowait(pcm)
 
         async def recv(self):
-            # Clock-based pacing: sleep until this frame is due.
-            # Without this, recv() is called thousands of times/sec,
-            # flooding the Opus encoder and producing garbled audio.
+            # Clock-based pacing using monotonic clock (immune to NTP jumps).
+            # Ensures aiortc receives exactly one frame every 20ms regardless
+            # of how fast the queue was filled, preventing pacing bursts.
             if not hasattr(self, "_start"):
-                self._start = time.time()
+                self._start = time.monotonic()
 
             # Get audio or silence — never block
             try:
@@ -480,11 +481,10 @@ def _make_tts_track():
             except asyncio.QueueEmpty:
                 pcm = bytes(self._samples_per_frame * 2)
 
-            # Ensure exactly one frame of samples, pad with silence if short
+            # Pad to exactly one frame if short
             frame_bytes = self._samples_per_frame * 2
             pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
 
-            # s16 interleaved, 1D array for mono — what aiortc's Opus encoder expects
             import numpy as np
             data = np.frombuffer(pcm, dtype=np.int16)
             frame = _av.AudioFrame.from_ndarray(data.reshape(1, -1), format="s16", layout="mono")
@@ -493,10 +493,10 @@ def _make_tts_track():
             frame.time_base = Fraction(1, self._sample_rate)
             self._pts += self._samples_per_frame
 
-            # Sleep until this frame's wall-clock time
+            # Sleep until this frame is due — monotonic for precision
             due = self._start + (self._pts / self._sample_rate)
-            wait = due - time.time()
-            if wait > 0:
+            wait = due - time.monotonic()
+            if wait > 0.001:  # skip sub-millisecond sleeps
                 await asyncio.sleep(wait)
 
             return frame
