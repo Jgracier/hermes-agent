@@ -407,21 +407,35 @@ def _make_tts_track():
             await self._queue.put(pcm)
 
         async def recv(self):
-            # Return immediately — don't wait for audio.
-            # Waiting causes variable-latency frames which aiortc encodes
-            # as jitter, producing choppy audio. Silence is cleaner than jitter.
+            # Clock-based pacing: sleep until this frame is due.
+            # Without this, recv() is called thousands of times/sec,
+            # flooding the Opus encoder and producing garbled audio.
+            if not hasattr(self, "_start"):
+                self._start = time.time()
+
+            # Get audio or silence — never block
             try:
                 pcm = self._queue.get_nowait()
             except asyncio.QueueEmpty:
-                pcm = bytes(self._samples_per_frame * 2)  # silence
+                pcm = bytes(self._samples_per_frame * 2)
 
-            samples = len(pcm) // 2
-            frame = _av.AudioFrame(format="s16", layout="mono", samples=samples)
+            # Ensure exactly one frame of samples
+            frame_bytes = self._samples_per_frame * 2
+            pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
+
+            frame = _av.AudioFrame(format="s16", layout="mono", samples=self._samples_per_frame)
             frame.sample_rate = self._sample_rate
             frame.pts = self._pts
             frame.time_base = Fraction(1, self._sample_rate)
             frame.planes[0].update(pcm)
-            self._pts += samples
+            self._pts += self._samples_per_frame
+
+            # Sleep until this frame's wall-clock time
+            due = self._start + (self._pts / self._sample_rate)
+            wait = due - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+
             return frame
 
     return TTSAudioTrack()
