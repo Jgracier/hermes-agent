@@ -435,10 +435,10 @@ def _make_tts_track():
             frame_bytes = self._samples_per_frame * 2
             pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
 
-            # s16p = planar signed 16-bit, shape (channels, samples) — unambiguous for mono
+            # s16 interleaved, 1D array for mono — what aiortc's Opus encoder expects
             import numpy as np
-            data = np.frombuffer(pcm, dtype=np.int16).reshape(1, self._samples_per_frame)
-            frame = _av.AudioFrame.from_ndarray(data, format="s16p", layout="mono")
+            data = np.frombuffer(pcm, dtype=np.int16)
+            frame = _av.AudioFrame.from_ndarray(data.reshape(1, -1), format="s16", layout="mono")
             frame.sample_rate = self._sample_rate
             frame.pts = self._pts
             frame.time_base = Fraction(1, self._sample_rate)
