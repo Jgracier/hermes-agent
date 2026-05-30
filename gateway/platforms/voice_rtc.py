@@ -55,7 +55,7 @@ class VoiceRTCSession:
         self._tts_track = None
         self._stop_event = asyncio.Event()
         self._tts_abort = asyncio.Event()
-        self._tts_playing = False  # true while audio is feeding to track (echo gate)
+        self._tts_mute_until: float = 0.0  # wall-clock time until which VAD is muted
         self._history: List[dict] = []  # conversation history for context
 
     # ------------------------------------------------------------------
@@ -127,8 +127,8 @@ class VoiceRTCSession:
             asyncio.ensure_future(sink.consume(track))
 
     async def _on_utterance(self, pcm_bytes: bytes, sample_rate: int) -> None:
-        # Suppress echo — ignore audio captured while TTS is playing
-        if self._tts_playing:
+        # Suppress echo — ignore audio while TTS is still playing back
+        if time.time() < self._tts_mute_until:
             return
 
         await self._interrupt()
@@ -310,20 +310,23 @@ class VoiceRTCSession:
             self._history = self._history[-40:]
 
         logger.info("[voice_rtc] %s response: %d sentences, queuing audio", self._client_id, len(tts_tasks))
-        self._tts_playing = True
-        try:
-            # Feed audio in order — each task finishes in parallel, we drain in sequence
-            for task in tts_tasks:
-                if abort.is_set() or self._stop_event.is_set():
-                    break
-                chunks = await task
-                if chunks and self._tts_track:
-                    for chunk in chunks:
-                        if abort.is_set():
-                            break
-                        await self._tts_track.put_chunk(chunk)
-        finally:
-            self._tts_playing = False
+        total_chunks = 0
+        # Feed audio in order — each task finishes in parallel, we drain in sequence
+        for task in tts_tasks:
+            if abort.is_set() or self._stop_event.is_set():
+                break
+            chunks = await task
+            if chunks and self._tts_track:
+                for chunk in chunks:
+                    if abort.is_set():
+                        break
+                    await self._tts_track.put_chunk(chunk)
+                    total_chunks += 1
+
+        # Mute VAD for estimated playback duration + 0.5s buffer for echo tail
+        if total_chunks > 0:
+            playback_seconds = total_chunks * 0.02  # 20ms per chunk
+            self._tts_mute_until = time.time() + playback_seconds + 0.5
 
 
 # ------------------------------------------------------------------
@@ -432,10 +435,10 @@ def _make_tts_track():
             frame_bytes = self._samples_per_frame * 2
             pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
 
-            # Use numpy for reliable int16 frame creation
+            # s16p = planar signed 16-bit, shape (channels, samples) — unambiguous for mono
             import numpy as np
             data = np.frombuffer(pcm, dtype=np.int16).reshape(1, self._samples_per_frame)
-            frame = _av.AudioFrame.from_ndarray(data, format="s16", layout="mono")
+            frame = _av.AudioFrame.from_ndarray(data, format="s16p", layout="mono")
             frame.sample_rate = self._sample_rate
             frame.pts = self._pts
             frame.time_base = Fraction(1, self._sample_rate)
