@@ -280,7 +280,14 @@ class VoiceRTCSession:
             try:
                 player = MediaPlayer(wav_path)
                 if player.audio is None:
+                    logger.warning("[voice_rtc] %s MediaPlayer.audio is None for %s", self._client_id, wav_path)
                     continue
+
+                if not self._sender:
+                    logger.warning("[voice_rtc] %s sender not ready, skipping playback", self._client_id)
+                    continue
+
+                logger.info("[voice_rtc] %s replaceTrack → player (%.2fs)", self._client_id, duration)
 
                 # Stop previous player before swapping
                 if prev_player is not None:
@@ -292,11 +299,15 @@ class VoiceRTCSession:
                 await self._sender.replaceTrack(player.audio)
                 prev_player = player
 
+                logger.info("[voice_rtc] %s replaceTrack done, sleeping %.2fs", self._client_id, duration)
+
                 # Track when this chunk ends for echo suppression
                 self._tts_play_until = time.monotonic() + duration + 0.2
 
                 # Wait for playback — duration is exact (from WAV sample count)
                 await asyncio.sleep(duration + 0.15)
+
+                logger.info("[voice_rtc] %s playback chunk done", self._client_id)
 
             except Exception as e:
                 logger.warning("[voice_rtc] playback error: %s", e)
