@@ -55,6 +55,7 @@ class VoiceRTCSession:
         self._tts_track = None
         self._stop_event = asyncio.Event()
         self._tts_abort = asyncio.Event()
+        self._tts_playing = False  # true while audio is feeding to track (echo gate)
         self._history: List[dict] = []  # conversation history for context
 
     # ------------------------------------------------------------------
@@ -126,6 +127,10 @@ class VoiceRTCSession:
             asyncio.ensure_future(sink.consume(track))
 
     async def _on_utterance(self, pcm_bytes: bytes, sample_rate: int) -> None:
+        # Suppress echo — ignore audio captured while TTS is playing
+        if self._tts_playing:
+            return
+
         await self._interrupt()
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -305,16 +310,20 @@ class VoiceRTCSession:
             self._history = self._history[-40:]
 
         logger.info("[voice_rtc] %s response: %d sentences, queuing audio", self._client_id, len(tts_tasks))
-        # Feed audio in order — each task finishes in parallel, we drain in sequence
-        for task in tts_tasks:
-            if abort.is_set() or self._stop_event.is_set():
-                break
-            chunks = await task
-            if chunks and self._tts_track:
-                for chunk in chunks:
-                    if abort.is_set():
-                        break
-                    await self._tts_track.put_chunk(chunk)
+        self._tts_playing = True
+        try:
+            # Feed audio in order — each task finishes in parallel, we drain in sequence
+            for task in tts_tasks:
+                if abort.is_set() or self._stop_event.is_set():
+                    break
+                chunks = await task
+                if chunks and self._tts_track:
+                    for chunk in chunks:
+                        if abort.is_set():
+                            break
+                        await self._tts_track.put_chunk(chunk)
+        finally:
+            self._tts_playing = False
 
 
 # ------------------------------------------------------------------
@@ -419,15 +428,17 @@ def _make_tts_track():
             except asyncio.QueueEmpty:
                 pcm = bytes(self._samples_per_frame * 2)
 
-            # Ensure exactly one frame of samples
+            # Ensure exactly one frame of samples, pad with silence if short
             frame_bytes = self._samples_per_frame * 2
             pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
 
-            frame = _av.AudioFrame(format="s16", layout="mono", samples=self._samples_per_frame)
+            # Use numpy for reliable int16 frame creation
+            import numpy as np
+            data = np.frombuffer(pcm, dtype=np.int16).reshape(1, self._samples_per_frame)
+            frame = _av.AudioFrame.from_ndarray(data, format="s16", layout="mono")
             frame.sample_rate = self._sample_rate
             frame.pts = self._pts
             frame.time_base = Fraction(1, self._sample_rate)
-            frame.planes[0].update(pcm)
             self._pts += self._samples_per_frame
 
             # Sleep until this frame's wall-clock time
