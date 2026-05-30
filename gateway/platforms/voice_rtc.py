@@ -27,22 +27,10 @@ from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Reuse RMS threshold from voice_mode.py — single source of truth
-try:
-    from tools.voice_mode import SILENCE_RMS_THRESHOLD as _SILENCE_RMS
-except ImportError:
-    _SILENCE_RMS = 200
-
 _SPEECH_MIN_SECONDS = 0.4  # ignore clips shorter than this (noise burst)
 _SILENCE_SECONDS = 0.8     # shorter than voice_mode's 3.0s — chat needs fast turn-taking
 _CHUNK_SIZE = 200           # LLM chars buffered before TTS flush
-
-
-def _rms(pcm_bytes: bytes) -> float:
-    if not pcm_bytes:
-        return 0.0
-    samples = struct.unpack_from(f"<{len(pcm_bytes)//2}h", pcm_bytes)
-    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+_VAD_AGGRESSIVENESS = 2    # webrtcvad: 0=least aggressive, 3=most aggressive
 
 
 class VoiceRTCSession:
@@ -336,16 +324,44 @@ class VoiceRTCSession:
 # ------------------------------------------------------------------
 
 class _AudioSink:
-    """Receives aiortc audio frames, runs RMS-VAD, fires on_utterance."""
+    """Receives aiortc audio frames, runs webrtcvad, fires on_utterance."""
+
+    # webrtcvad requires 16kHz mono s16 with exact 10/20/30ms frames
+    _VAD_RATE = 16000
+    _VAD_FRAME_MS = 20
+    _VAD_FRAME_SAMPLES = _VAD_RATE * _VAD_FRAME_MS // 1000  # 320 samples
+    _VAD_FRAME_BYTES = _VAD_FRAME_SAMPLES * 2               # 640 bytes
 
     def __init__(self, on_utterance):
         self._on_utterance = on_utterance
-        self._buf = bytearray()
+        self._buf = bytearray()          # accumulates speech audio at original rate
+        self._vad_buf = bytearray()      # accumulates downsampled audio for VAD
         self._speech_started = False
         self._silence_start: Optional[float] = None
         self._speech_start: Optional[float] = None
         self._sample_rate = 48000
-        self._resampler = None  # created once on first frame
+        self._resampler = None           # 48kHz → original rate (for speech buffer)
+        self._vad_resampler = None       # 48kHz → 16kHz (for VAD)
+        try:
+            import webrtcvad
+            self._vad = webrtcvad.Vad(_VAD_AGGRESSIVENESS)
+        except Exception:
+            self._vad = None  # fallback: accept all audio
+
+    def _is_speech(self, pcm_16k: bytes) -> bool:
+        """Run webrtcvad on a 20ms 16kHz frame. Returns True if speech detected."""
+        if self._vad is None:
+            return True
+        # Process all complete 20ms frames in the buffer
+        results = []
+        for i in range(0, len(pcm_16k) - self._VAD_FRAME_BYTES + 1, self._VAD_FRAME_BYTES):
+            frame = pcm_16k[i:i + self._VAD_FRAME_BYTES]
+            try:
+                results.append(self._vad.is_speech(frame, self._VAD_RATE))
+            except Exception:
+                results.append(True)
+        # Speech if majority of frames are speech
+        return bool(results) and sum(results) > len(results) / 2
 
     async def consume(self, track) -> None:
         import av as _av
@@ -359,21 +375,31 @@ class _AudioSink:
 
             self._sample_rate = frame.sample_rate
 
+            # Persistent resamplers — created once
             if self._resampler is None:
                 self._resampler = _av.AudioResampler(
                     format="s16", layout="mono", rate=frame.sample_rate
                 )
+            if self._vad_resampler is None:
+                self._vad_resampler = _av.AudioResampler(
+                    format="s16", layout="mono", rate=self._VAD_RATE
+                )
 
+            # Decode to PCM at original rate (for speech buffer)
             pcm = b""
             for r in self._resampler.resample(frame):
                 pcm += bytes(r.planes[0])
 
+            # Decode to 16kHz for VAD
+            pcm_16k = b""
+            for r in self._vad_resampler.resample(frame):
+                pcm_16k += bytes(r.planes[0])
+
             if not pcm:
                 continue
 
-            rms = _rms(pcm)
             now = time.monotonic()
-            is_speech = rms > _SILENCE_RMS
+            is_speech = self._is_speech(pcm_16k)
 
             if is_speech:
                 if not self._speech_started:
