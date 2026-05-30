@@ -206,11 +206,14 @@ class VoiceRTCSession:
             "X-Hermes-Session-Id": self._session_id,
         }, method="POST")
 
-        # asyncio.Queue bridging the executor thread → async consumer
-        sentence_q: asyncio.Queue = asyncio.Queue()
+        # asyncio.Queue: stream full response then TTS as one or two chunks.
+        # Splitting into many sentences = many Edge TTS calls = jitter between each.
+        # Instead: buffer 200 chars then flush, giving at most 2-3 TTS calls per response.
+        chunk_q: asyncio.Queue = asyncio.Queue()
+        _CHUNK_SIZE = 200  # chars — tune up for fewer calls, down for lower first-word latency
 
-        def _stream_sentences() -> None:
-            """Run in executor: parse SSE, put complete sentences on sentence_q."""
+        def _stream_chunks() -> None:
+            """Run in executor: parse SSE, emit text chunks of ~CHUNK_SIZE chars."""
             buf = ""
             try:
                 resp = urllib.request.urlopen(req, timeout=60)
@@ -230,23 +233,25 @@ class VoiceRTCSession:
                                  .get("content", ""))
                         if delta:
                             buf += delta
-                            while True:
-                                m = re.search(r'(?<=[.!?])\s+', buf)
-                                if not m:
-                                    break
-                                sentence = buf[:m.start()].strip()
-                                buf = buf[m.end():]
-                                if sentence:
-                                    loop.call_soon_threadsafe(sentence_q.put_nowait, sentence)
+                            # Flush on sentence boundary after enough chars — avoids mid-word cuts
+                            if len(buf) >= _CHUNK_SIZE:
+                                m = re.search(r'(?<=[.!?,;])\s+', buf)
+                                if m:
+                                    chunk = buf[:m.start()].strip()
+                                    buf = buf[m.end():]
+                                    if chunk:
+                                        loop.call_soon_threadsafe(chunk_q.put_nowait, chunk)
                     except Exception:
                         pass
             except Exception as e:
                 logger.warning("[voice_rtc] LLM stream failed: %s", e)
             finally:
                 if buf.strip():
-                    loop.call_soon_threadsafe(sentence_q.put_nowait, buf.strip())
-                loop.call_soon_threadsafe(sentence_q.put_nowait, None)
+                    loop.call_soon_threadsafe(chunk_q.put_nowait, buf.strip())
+                loop.call_soon_threadsafe(chunk_q.put_nowait, None)
                 loop.call_soon_threadsafe(logger.info, "[voice_rtc] LLM stream complete")
+
+        sentence_q = chunk_q  # alias so rest of code is unchanged
 
         def _tts_to_chunks(sentence: str) -> List[bytes]:
             """TTS one sentence → list of raw PCM chunks, ready to queue."""
@@ -279,7 +284,7 @@ class VoiceRTCSession:
                     pass
 
         # Start LLM streaming in background thread
-        stream_future = loop.run_in_executor(None, _stream_sentences)
+        stream_future = loop.run_in_executor(None, _stream_chunks)
 
         # Collect sentences and fire TTS tasks immediately (concurrent)
         tts_tasks = []
