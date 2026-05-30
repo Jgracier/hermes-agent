@@ -2,13 +2,13 @@
 WebRTC voice session for the Hermes API server.
 
 One VoiceRTCSession per connected client. Full-duplex audio:
-  iPhone mic → VAD → STT → LLM streaming → sentence TTS pipeline → speaker
+  iPhone mic → VAD → STT → LLM streaming → TTS → WebRTC Opus → speaker
 
-Latency design:
-  - Sentence N TTS starts immediately when sentence N arrives from LLM stream
-  - Sentence N+1 TTS runs concurrently while sentence N's audio plays
-  - Audio fed to track queue in order — seamless FIFO playback, no gaps
-  - Interrupt: VAD fires → abort flag → cancel in-flight run → restart
+Audio delivery:
+  - TTS generates MP3, decoded to WAV with silence trimmed
+  - MediaPlayer plays WAV via aiortc's background thread (no asyncio timing)
+  - RTCRtpSender.replaceTrack() swaps tracks per response without renegotiation
+  - Interrupt: replaceTrack(silent) immediately cuts outbound audio
 
 Dependencies: aiortc (pip install aiortc)
 """
@@ -35,6 +35,7 @@ except ImportError:
 
 _SPEECH_MIN_SECONDS = 0.4  # ignore clips shorter than this (noise burst)
 _SILENCE_SECONDS = 0.8     # shorter than voice_mode's 3.0s — chat needs fast turn-taking
+_CHUNK_SIZE = 200           # LLM chars buffered before TTS flush
 
 
 def _rms(pcm_bytes: bytes) -> float:
@@ -52,11 +53,12 @@ class VoiceRTCSession:
         self._client_id = client_id
         self._session_id = session_id or f"voice-{client_id}-{int(time.time())}"
         self._pc = None
-        self._tts_track = None
+        self._sender = None
+        self._silent_track = None
         self._stop_event = asyncio.Event()
         self._tts_abort = asyncio.Event()
-        self._tts_mute_until: float = 0.0  # wall-clock time until which VAD is muted
-        self._history: List[dict] = []  # conversation history for context
+        self._tts_play_until: float = 0.0  # monotonic time when current playback ends
+        self._history: List[dict] = []
 
     # ------------------------------------------------------------------
     # Entry point
@@ -70,18 +72,13 @@ class VoiceRTCSession:
             await ws.send_json({"error": "aiortc not installed on server"})
             return
 
-        self._ws = ws
-
         self._pc = RTCPeerConnection()
         sink = _AudioSink(self._on_utterance)
         self._pc.on("track", lambda track: self._on_track(track, sink))
         self._pc.on("connectionstatechange", lambda: logger.info(
             "[voice_rtc] %s state: %s", self._client_id, self._pc.connectionState))
 
-        # Outbound audio: silent track initially, swapped per-response via
-        # RTCRtpSender.replaceTrack() with a MediaPlayer-backed track.
-        # MediaPlayer uses a background thread + aiortc's own clock — no asyncio
-        # timing jitter. Opus encoding at correct rate is handled by aiortc.
+        # Silent track as initial placeholder; swapped to MediaPlayer per response
         self._silent_track = _make_silent_track()
         self._sender = self._pc.addTrack(self._silent_track)
 
@@ -125,7 +122,7 @@ class VoiceRTCSession:
             logger.info("[voice_rtc] %s session closed", self._client_id)
 
     # ------------------------------------------------------------------
-    # Track / utterance handling
+    # Inbound audio handling
     # ------------------------------------------------------------------
 
     def _on_track(self, track, sink) -> None:
@@ -133,8 +130,8 @@ class VoiceRTCSession:
             asyncio.ensure_future(sink.consume(track))
 
     async def _on_utterance(self, pcm_bytes: bytes, sample_rate: int) -> None:
-        # Suppress echo — ignore audio while TTS is still playing back
-        if time.time() < self._tts_mute_until:
+        # Echo suppression: ignore mic input while TTS is still playing
+        if time.monotonic() < self._tts_play_until:
             return
 
         await self._interrupt()
@@ -156,7 +153,7 @@ class VoiceRTCSession:
         if not transcript:
             return
 
-        # Filter whisper hallucinations (". . ." / very short noise)
+        # Filter whisper hallucinations
         cleaned = transcript.strip().strip(".,!? \t")
         if len(cleaned) < 3 or all(c in "., " for c in cleaned):
             return
@@ -172,9 +169,10 @@ class VoiceRTCSession:
         asyncio.ensure_future(_safe())
 
     async def _interrupt(self) -> None:
+        """Abort in-flight TTS and cut outbound audio immediately."""
         self._tts_abort.set()
-        # Swap back to silent track immediately to cut outbound audio
-        if hasattr(self, "_sender") and self._sender and hasattr(self, "_silent_track"):
+        self._tts_play_until = 0.0
+        if self._sender and self._silent_track:
             try:
                 await self._sender.replaceTrack(self._silent_track)
             except Exception:
@@ -183,25 +181,16 @@ class VoiceRTCSession:
         self._tts_abort.clear()
 
     # ------------------------------------------------------------------
-    # LLM → sentence streaming → parallel TTS → ordered audio queue
+    # LLM → TTS → MediaPlayer pipeline
     # ------------------------------------------------------------------
 
     async def _run_and_speak(self, text: str) -> None:
-        """
-        Pipeline:
-          1. POST /v1/chat/completions streaming
-          2. Detect sentence boundaries as deltas arrive
-          3. Fire TTS task for each sentence immediately (concurrent)
-          4. Feed audio to track queue in order (seamless playback)
-        """
         port = os.getenv("API_SERVER_PORT", "8642")
         api_key = os.getenv("API_SERVER_KEY", "")
-        url = f"http://localhost:{port}/v1/chat/completions"
         abort = self._tts_abort
         loop = asyncio.get_event_loop()
-        logger.info("[voice_rtc] %s LLM start: %s", self._client_id, text[:50])
+        logger.info("[voice_rtc] %s LLM: %s", self._client_id, text[:50])
 
-        # Maintain conversation history for multi-turn context
         self._history.append({"role": "user", "content": text})
         messages = list(self._history)
 
@@ -212,20 +201,20 @@ class VoiceRTCSession:
         }).encode()
 
         import urllib.request
-        req = urllib.request.Request(url, data=body, headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-Hermes-Session-Id": self._session_id,
-        }, method="POST")
+        req = urllib.request.Request(
+            f"http://localhost:{port}/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "X-Hermes-Session-Id": self._session_id,
+            },
+            method="POST",
+        )
 
-        # asyncio.Queue: stream full response then TTS as one or two chunks.
-        # Splitting into many sentences = many Edge TTS calls = jitter between each.
-        # Instead: buffer 200 chars then flush, giving at most 2-3 TTS calls per response.
         chunk_q: asyncio.Queue = asyncio.Queue()
-        _CHUNK_SIZE = 200  # chars — tune up for fewer calls, down for lower first-word latency
 
         def _stream_chunks() -> None:
-            """Run in executor: parse SSE, emit text chunks of ~CHUNK_SIZE chars."""
             buf = ""
             try:
                 resp = urllib.request.urlopen(req, timeout=60)
@@ -245,7 +234,6 @@ class VoiceRTCSession:
                                  .get("content", ""))
                         if delta:
                             buf += delta
-                            # Flush on sentence boundary after enough chars — avoids mid-word cuts
                             if len(buf) >= _CHUNK_SIZE:
                                 m = re.search(r'(?<=[.!?,;])\s+', buf)
                                 if m:
@@ -256,153 +244,91 @@ class VoiceRTCSession:
                     except Exception:
                         pass
             except Exception as e:
-                logger.warning("[voice_rtc] LLM stream failed: %s", e)
+                logger.warning("[voice_rtc] LLM failed: %s", e)
             finally:
                 if buf.strip():
                     loop.call_soon_threadsafe(chunk_q.put_nowait, buf.strip())
                 loop.call_soon_threadsafe(chunk_q.put_nowait, None)
-                loop.call_soon_threadsafe(logger.info, "[voice_rtc] LLM stream complete")
 
-        sentence_q = chunk_q  # alias so rest of code is unchanged
-
-        def _trim_silence(pcm: bytes, sample_rate: int = 48000,
-                           thresh: int = 80, max_silence_ms: int = 80) -> bytes:
-            """Trim leading/trailing silence and reduce mid-audio silence gaps.
-
-            Edge TTS inserts ~950ms of silence between sentences and at boundaries.
-            Reduce any silence run > max_silence_ms to max_silence_ms.
-            """
-            import struct as _struct
-            if not pcm:
-                return pcm
-            n = len(pcm) // 2
-            samples = list(_struct.unpack_from(f"<{n}h", pcm))
-            max_silence_samps = int(sample_rate * max_silence_ms / 1000)
-
-            # Trim leading silence
-            start = 0
-            while start < n and abs(samples[start]) < thresh:
-                start += 1
-            start = max(0, start - max_silence_samps)
-
-            # Trim trailing silence
-            end = n - 1
-            while end > start and abs(samples[end]) < thresh:
-                end -= 1
-            end = min(n - 1, end + max_silence_samps)
-
-            # Reduce mid-audio silence runs > max_silence_ms
-            out = []
-            i = start
-            while i <= end:
-                if abs(samples[i]) < thresh:
-                    run_start = i
-                    while i <= end and abs(samples[i]) < thresh:
-                        i += 1
-                    run_len = i - run_start
-                    # Keep at most max_silence_samps of silence
-                    keep = min(run_len, max_silence_samps)
-                    out.extend(samples[run_start:run_start + keep])
-                else:
-                    out.append(samples[i])
-                    i += 1
-
-            if not out:
-                return b""
-            return _struct.pack(f"<{len(out)}h", *out)
-
-        def _tts_to_chunks(text: str) -> bytes:
-            """TTS text → raw MP3 bytes for direct WebSocket delivery."""
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                tmp = f.name
-            try:
-                if not _tts(text, tmp):
-                    return b""
-                with open(tmp, "rb") as f:
-                    return f.read()
-            except Exception as e:
-                logger.warning("[voice_rtc] TTS error: %s", e)
-                return b""
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-
-        # Start LLM streaming in background thread
         stream_future = loop.run_in_executor(None, _stream_chunks)
 
-        # Collect sentences and fire TTS tasks immediately (concurrent)
+        # Collect text chunks and fire TTS concurrently per chunk
         tts_tasks = []
-        full_response_parts = []
+        full_parts = []
 
         while not abort.is_set() and not self._stop_event.is_set():
             try:
-                sentence = await asyncio.wait_for(sentence_q.get(), timeout=30.0)
+                chunk = await asyncio.wait_for(chunk_q.get(), timeout=30.0)
             except asyncio.TimeoutError:
                 break
-            if sentence is None:
+            if chunk is None:
                 break
-            full_response_parts.append(sentence)
-            # Fire TTS immediately — concurrent with remaining LLM generation
-            task = loop.run_in_executor(None, _tts_to_chunks, sentence)
-            tts_tasks.append(task)
+            full_parts.append(chunk)
+            tts_tasks.append(loop.run_in_executor(None, _tts_to_wav, chunk))
 
         await stream_future
 
         if not tts_tasks or abort.is_set() or self._stop_event.is_set():
             return
 
-        # Store assistant response in history
-        full_response = " ".join(full_response_parts)
+        full_response = " ".join(full_parts)
         self._history.append({"role": "assistant", "content": full_response})
-        # Cap history at 20 turns to avoid token bloat
         if len(self._history) > 40:
             self._history = self._history[-40:]
 
-        logger.info("[voice_rtc] %s response: %d chunks, playing via MediaPlayer", self._client_id, len(tts_tasks))
-        # Play each TTS chunk via MediaPlayer → replaceTrack().
-        # MediaPlayer uses a background thread for frame timing — no asyncio jitter.
-        # Opus encoding at the correct rate is handled entirely by aiortc.
+        logger.info("[voice_rtc] %s playing %d audio chunk(s)", self._client_id, len(tts_tasks))
+
         from aiortc.contrib.media import MediaPlayer
+        prev_player = None
 
         for task in tts_tasks:
             if abort.is_set() or self._stop_event.is_set():
                 break
-            mp3_bytes = await task
-            if not mp3_bytes:
+
+            wav_path, duration = await task
+            if not wav_path:
                 continue
 
-            # Write to temp file for MediaPlayer
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-                f.write(mp3_bytes)
-                tmp_mp3 = f.name
-
             try:
-                player = MediaPlayer(tmp_mp3)
+                player = MediaPlayer(wav_path)
                 if player.audio is None:
                     continue
 
-                # Swap in the player track — aiortc handles timing/encoding
+                # Stop previous player before swapping
+                if prev_player is not None:
+                    try:
+                        prev_player.audio.stop()
+                    except Exception:
+                        pass
+
                 await self._sender.replaceTrack(player.audio)
+                prev_player = player
 
-                # Wait for playback to finish (duration from file)
-                import av as _av
-                container = _av.open(tmp_mp3)
-                duration = float(container.duration) / 1_000_000 if container.duration else 3.0
-                container.close()
+                # Track when this chunk ends for echo suppression
+                self._tts_play_until = time.monotonic() + duration + 0.2
 
-                await asyncio.sleep(duration + 0.1)  # small tail buffer
+                # Wait for playback — duration is exact (from WAV sample count)
+                await asyncio.sleep(duration + 0.15)
 
-                if not abort.is_set():
-                    await self._sender.replaceTrack(self._silent_track)
             except Exception as e:
-                logger.warning("[voice_rtc] MediaPlayer error: %s", e)
+                logger.warning("[voice_rtc] playback error: %s", e)
             finally:
                 try:
-                    os.unlink(tmp_mp3)
+                    os.unlink(wav_path)
                 except OSError:
                     pass
+
+        # Back to silence after all chunks play
+        if not abort.is_set() and self._sender and self._silent_track:
+            try:
+                await self._sender.replaceTrack(self._silent_track)
+            except Exception:
+                pass
+        if prev_player is not None:
+            try:
+                prev_player.audio.stop()
+            except Exception:
+                pass
 
 
 # ------------------------------------------------------------------
@@ -433,7 +359,6 @@ class _AudioSink:
 
             self._sample_rate = frame.sample_rate
 
-            # Persistent resampler — created once, not per frame
             if self._resampler is None:
                 self._resampler = _av.AudioResampler(
                     format="s16", layout="mono", rate=frame.sample_rate
@@ -474,11 +399,11 @@ class _AudioSink:
 
 
 # ------------------------------------------------------------------
-# Outbound audio tracks
+# Silent placeholder track
 # ------------------------------------------------------------------
 
 def _make_silent_track():
-    """Minimal silent audio track — placeholder between TTS responses."""
+    """Clock-paced silent track — holds the sender slot between responses."""
     from aiortc import MediaStreamTrack
     import av as _av
 
@@ -491,7 +416,6 @@ def _make_silent_track():
             self._start = time.monotonic()
 
         async def recv(self):
-            # Pace at real-time rate so aiortc doesn't flood
             due = self._start + (self._pts / 48000)
             wait = due - time.monotonic()
             if wait > 0.001:
@@ -507,60 +431,6 @@ def _make_silent_track():
     return SilentTrack()
 
 
-def _make_tts_track():
-    from aiortc import MediaStreamTrack
-    import av as _av
-
-    class TTSAudioTrack(MediaStreamTrack):
-        kind = "audio"
-
-        def __init__(self):
-            super().__init__()
-            self._queue: asyncio.Queue = asyncio.Queue()
-            self._pts = 0
-            self._sample_rate = 48000
-            self._samples_per_frame = 960  # 20ms at 48kHz
-
-        def put_chunk_nowait(self, pcm: bytes) -> None:
-            """Non-blocking put — called from audio feeding loop."""
-            self._queue.put_nowait(pcm)
-
-        async def recv(self):
-            # Clock-based pacing using monotonic clock (immune to NTP jumps).
-            # Ensures aiortc receives exactly one frame every 20ms regardless
-            # of how fast the queue was filled, preventing pacing bursts.
-            if not hasattr(self, "_start"):
-                self._start = time.monotonic()
-
-            # Get audio or silence — never block
-            try:
-                pcm = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pcm = bytes(self._samples_per_frame * 2)
-
-            # Pad to exactly one frame if short
-            frame_bytes = self._samples_per_frame * 2
-            pcm = (pcm + bytes(frame_bytes))[:frame_bytes]
-
-            import numpy as np
-            data = np.frombuffer(pcm, dtype=np.int16)
-            frame = _av.AudioFrame.from_ndarray(data.reshape(1, -1), format="s16", layout="mono")
-            frame.sample_rate = self._sample_rate
-            frame.pts = self._pts
-            frame.time_base = Fraction(1, self._sample_rate)
-            self._pts += self._samples_per_frame
-
-            # Sleep until this frame is due — monotonic for precision
-            due = self._start + (self._pts / self._sample_rate)
-            wait = due - time.monotonic()
-            if wait > 0.001:  # skip sub-millisecond sleeps
-                await asyncio.sleep(wait)
-
-            return frame
-
-    return TTSAudioTrack()
-
-
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
@@ -571,6 +441,82 @@ def _write_wav(path: str, pcm: bytes, sample_rate: int) -> None:
         w.setsampwidth(2)
         w.setframerate(sample_rate)
         w.writeframes(pcm)
+
+
+def _trim_silence(pcm: bytes, sample_rate: int = 48000,
+                  thresh: int = 80, max_silence_ms: int = 80) -> bytes:
+    """Reduce Edge TTS silence padding from ~950ms to max_silence_ms."""
+    if not pcm:
+        return pcm
+    n = len(pcm) // 2
+    samples = list(struct.unpack_from(f"<{n}h", pcm))
+    max_s = int(sample_rate * max_silence_ms / 1000)
+
+    start = 0
+    while start < n and abs(samples[start]) < thresh:
+        start += 1
+    start = max(0, start - max_s)
+
+    end = n - 1
+    while end > start and abs(samples[end]) < thresh:
+        end -= 1
+    end = min(n - 1, end + max_s)
+
+    out, i = [], start
+    while i <= end:
+        if abs(samples[i]) < thresh:
+            rs = i
+            while i <= end and abs(samples[i]) < thresh:
+                i += 1
+            out.extend(samples[rs:rs + min(i - rs, max_s)])
+        else:
+            out.append(samples[i])
+            i += 1
+
+    if not out:
+        return b""
+    return struct.pack(f"<{len(out)}h", *out)
+
+
+def _tts_to_wav(text: str):
+    """TTS text → (wav_path, duration_seconds). Returns (None, 0) on failure."""
+    import av as _av
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        mp3_path = f.name
+    try:
+        if not _tts(text, mp3_path):
+            return None, 0.0
+
+        # Decode MP3 → PCM, trim silence, save as WAV
+        container = _av.open(mp3_path)
+        resampler = _av.AudioResampler(format="s16", layout="mono", rate=48000)
+        buf = b""
+        for frame in container.decode(audio=0):
+            for r in resampler.resample(frame):
+                buf += bytes(r.planes[0])
+        for r in resampler.resample(None):
+            buf += bytes(r.planes[0])
+        container.close()
+
+        buf = _trim_silence(buf)
+        if not buf:
+            return None, 0.0
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            wav_path = f.name
+        _write_wav(wav_path, buf, 48000)
+
+        duration = len(buf) / 2 / 48000  # exact: samples / sample_rate
+        return wav_path, duration
+
+    except Exception as e:
+        logger.warning("[voice_rtc] TTS→WAV error: %s", e)
+        return None, 0.0
+    finally:
+        try:
+            os.unlink(mp3_path)
+        except OSError:
+            pass
 
 
 def _transcribe(wav_path: str) -> str:
