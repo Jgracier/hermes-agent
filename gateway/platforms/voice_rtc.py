@@ -407,9 +407,12 @@ def _make_tts_track():
             await self._queue.put(pcm)
 
         async def recv(self):
+            # Return immediately — don't wait for audio.
+            # Waiting causes variable-latency frames which aiortc encodes
+            # as jitter, producing choppy audio. Silence is cleaner than jitter.
             try:
-                pcm = await asyncio.wait_for(self._queue.get(), timeout=0.02)
-            except asyncio.TimeoutError:
+                pcm = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
                 pcm = bytes(self._samples_per_frame * 2)  # silence
 
             samples = len(pcm) // 2
