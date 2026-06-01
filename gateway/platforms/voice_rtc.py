@@ -141,9 +141,11 @@ class VoiceRTCSession:
         if not transcript:
             return
 
-        # Filter whisper hallucinations
-        cleaned = transcript.strip().strip(".,!? \t")
-        if len(cleaned) < 3 or all(c in "., " for c in cleaned):
+        # Filter Whisper hallucinations on silence/noise — reuse Hermes's
+        # curated phrase list and repetition patterns ("Thank you", "you",
+        # "Продолжение следует...", subtitle credits, etc.)
+        if _is_hallucination(transcript):
+            logger.debug("[voice_rtc] %s filtered hallucination: %s", self._client_id, transcript[:60])
             return
 
         logger.info("[voice_rtc] %s transcript: %s", self._client_id, transcript[:80])
@@ -564,6 +566,19 @@ def _transcribe(wav_path: str) -> str:
     except Exception as e:
         logger.warning("[voice_rtc] STT error: %s", e)
         return ""
+
+
+def _is_hallucination(transcript: str) -> bool:
+    """True if transcript is a known Whisper silence hallucination.
+
+    Delegates to Hermes's curated filter (tools.voice_mode). Falls back to a
+    minimal length check only if that import is unavailable.
+    """
+    try:
+        from tools.voice_mode import is_whisper_hallucination
+        return is_whisper_hallucination(transcript)
+    except ImportError:
+        return len(transcript.strip().strip(".,!? \t")) < 3
 
 
 def _tts(text: str, output_path: str) -> bool:
