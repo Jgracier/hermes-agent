@@ -337,44 +337,39 @@ class VoiceRTCSession:
 # ------------------------------------------------------------------
 
 class _AudioSink:
-    """Receives aiortc audio frames, runs webrtcvad, fires on_utterance."""
+    """Receives aiortc audio frames and detects utterances using the standard
+    py-webrtcvad collector algorithm with hysteresis.
 
-    # webrtcvad requires 16kHz mono s16 with exact 10/20/30ms frames
-    _VAD_RATE = 16000
-    _VAD_FRAME_MS = 20
-    _VAD_FRAME_SAMPLES = _VAD_RATE * _VAD_FRAME_MS // 1000  # 320 samples
-    _VAD_FRAME_BYTES = _VAD_FRAME_SAMPLES * 2               # 640 bytes
+    Whisper runs at 16kHz natively, so we resample once to 16kHz and use the
+    SAME stream for both VAD and the captured utterance — no dual-buffer drift.
+
+    Hysteresis (the core fix for noise-triggering):
+      - To START capturing: ≥ _TRIGGER_RATIO of frames in a sliding window
+        must be speech. A single noise burst cannot trip it.
+      - To END the utterance: ≥ _TRIGGER_RATIO of the window must be silence.
+    """
+
+    _RATE = 16000
+    _FRAME_MS = 20
+    _FRAME_SAMPLES = _RATE * _FRAME_MS // 1000   # 320 samples
+    _FRAME_BYTES = _FRAME_SAMPLES * 2            # 640 bytes
+    _WINDOW_FRAMES = 15                          # 300ms sliding window
+    _TRIGGER_RATIO = 0.9                         # 90% agreement to flip state
+    _MIN_UTTERANCE_FRAMES = int(_SPEECH_MIN_SECONDS * 1000 / _FRAME_MS)
 
     def __init__(self, on_utterance):
+        from collections import deque
         self._on_utterance = on_utterance
-        self._buf = bytearray()          # accumulates speech audio at original rate
-        self._vad_buf = bytearray()      # accumulates downsampled audio for VAD
-        self._speech_started = False
-        self._silence_start: Optional[float] = None
-        self._speech_start: Optional[float] = None
-        self._sample_rate = 48000
-        self._resampler = None           # 48kHz → original rate (for speech buffer)
-        self._vad_resampler = None       # 48kHz → 16kHz (for VAD)
+        self._pending = bytearray()              # raw 16kHz bytes not yet framed
+        self._utterance = bytearray()            # captured speech (16kHz)
+        self._window = deque(maxlen=self._WINDOW_FRAMES)  # (frame, is_speech)
+        self._triggered = False
+        self._resampler = None
         try:
             import webrtcvad
             self._vad = webrtcvad.Vad(_VAD_AGGRESSIVENESS)
         except Exception:
-            self._vad = None  # fallback: accept all audio
-
-    def _is_speech(self, pcm_16k: bytes) -> bool:
-        """Run webrtcvad on a 20ms 16kHz frame. Returns True if speech detected."""
-        if self._vad is None:
-            return True
-        # Process all complete 20ms frames in the buffer
-        results = []
-        for i in range(0, len(pcm_16k) - self._VAD_FRAME_BYTES + 1, self._VAD_FRAME_BYTES):
-            frame = pcm_16k[i:i + self._VAD_FRAME_BYTES]
-            try:
-                results.append(self._vad.is_speech(frame, self._VAD_RATE))
-            except Exception:
-                results.append(True)
-        # Speech if majority of frames are speech
-        return bool(results) and sum(results) > len(results) / 2
+            self._vad = None
 
     async def consume(self, track) -> None:
         import av as _av
@@ -386,55 +381,52 @@ class _AudioSink:
             except Exception:
                 break
 
-            self._sample_rate = frame.sample_rate
-
-            # Persistent resamplers — created once
             if self._resampler is None:
                 self._resampler = _av.AudioResampler(
-                    format="s16", layout="mono", rate=frame.sample_rate
-                )
-            if self._vad_resampler is None:
-                self._vad_resampler = _av.AudioResampler(
-                    format="s16", layout="mono", rate=self._VAD_RATE
+                    format="s16", layout="mono", rate=self._RATE
                 )
 
-            # Decode to PCM at original rate (for speech buffer)
-            pcm = b""
             for r in self._resampler.resample(frame):
-                pcm += bytes(r.planes[0])
+                self._pending += bytes(r.planes[0])
 
-            # Decode to 16kHz for VAD
-            pcm_16k = b""
-            for r in self._vad_resampler.resample(frame):
-                pcm_16k += bytes(r.planes[0])
+            # Process every complete 20ms frame
+            while len(self._pending) >= self._FRAME_BYTES:
+                chunk = bytes(self._pending[:self._FRAME_BYTES])
+                del self._pending[:self._FRAME_BYTES]
+                self._process_frame(chunk)
 
-            if not pcm:
-                continue
+    def _process_frame(self, chunk: bytes) -> None:
+        if self._vad is None:
+            return  # no VAD available — silently drop (don't flood STT)
+        try:
+            speech = self._vad.is_speech(chunk, self._RATE)
+        except Exception:
+            return
 
-            now = time.monotonic()
-            is_speech = self._is_speech(pcm_16k)
+        self._window.append((chunk, speech))
 
-            if is_speech:
-                if not self._speech_started:
-                    self._speech_started = True
-                    self._speech_start = now
-                    self._buf.clear()
-                self._silence_start = None
-                self._buf.extend(pcm)
-            elif self._speech_started:
-                self._buf.extend(pcm)
-                if self._silence_start is None:
-                    self._silence_start = now
-                elif now - self._silence_start >= _SILENCE_SECONDS:
-                    duration = now - (self._speech_start or now)
-                    if duration >= _SPEECH_MIN_SECONDS:
-                        asyncio.ensure_future(
-                            self._on_utterance(bytes(self._buf), self._sample_rate)
-                        )
-                    self._buf.clear()
-                    self._speech_started = False
-                    self._silence_start = None
-                    self._speech_start = None
+        if not self._triggered:
+            # Enter speech only when the window is overwhelmingly speech
+            n_speech = sum(1 for _, s in self._window if s)
+            if n_speech >= self._TRIGGER_RATIO * self._WINDOW_FRAMES:
+                self._triggered = True
+                # Seed utterance with the buffered window (captures onset)
+                for f, _ in self._window:
+                    self._utterance += f
+                self._window.clear()
+        else:
+            self._utterance += chunk
+            # End utterance when the window is overwhelmingly silence
+            n_silence = sum(1 for _, s in self._window if not s)
+            if n_silence >= self._TRIGGER_RATIO * self._WINDOW_FRAMES:
+                utterance = bytes(self._utterance)
+                n_frames = len(utterance) // self._FRAME_BYTES
+                self._triggered = False
+                self._utterance.clear()
+                self._window.clear()
+                # Require a minimum length so a brief blip isn't transcribed
+                if n_frames >= self._MIN_UTTERANCE_FRAMES:
+                    asyncio.ensure_future(self._on_utterance(utterance, self._RATE))
 
 
 # ------------------------------------------------------------------
